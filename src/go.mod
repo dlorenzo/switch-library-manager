@@ -6,7 +6,7 @@ require (
 	github.com/asticode/go-astikit v0.59.0
 	github.com/avast/retry-go/v5 v5.0.0
 	github.com/firebat20/go-astilectron v0.0.0-20260907022357-e8b864b81d72
-	github.com/firebat20/go-astilectron-bootstrap v0.0.0-20260819000807-09f13901b278
+	github.com/firebat20/go-astilectron-bootstrap v0.0.0-20260919205804-5e3a314432f0
 	github.com/hashicorp/go-version v1.9.0
 	github.com/jedib0t/go-pretty/v6 v6.8.3
 	github.com/magiconair/properties v1.18.12

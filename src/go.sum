@@ -10,8 +10,8 @@ github.com/clipperhouse/uax29/v2 v2.7.0 h1:+gs4oBZ2gPfVrKPthwbMzWZDaAFPGYK72F0NJ
 github.com/clipperhouse/uax29/v2 v2.7.0/go.mod h1:EFJ2TJMRUaplDxHKj1qAEhCtQPW2tJSwu5BF98AuoVM=
 github.com/firebat20/go-astilectron v0.0.0-20260907022357-e8b864b81d72 h1:0ZePJ273cC/AvGu9gmsCbdIipjiUTNY56jb35QAdobY=
 github.com/firebat20/go-astilectron v0.0.0-20260907022357-e8b864b81d72/go.mod h1:cMFJoL9UiAtfenTyYLhrFEPUIC7j+voOP5Am8lYU0PU=
-github.com/firebat20/go-astilectron-bootstrap v0.0.0-20260819000807-09f13901b278 h1:LST8eG82cQ2gCyS4iHvtwU5P+en1y4TN1h2C74OHLn4=
-github.com/firebat20/go-astilectron-bootstrap v0.0.0-20260819000807-09f13901b278/go.mod h1:vF9O1VJuNK0SwRvVvrTf25XN/rM9j+gXj7DiC+JvhUU=
+github.com/firebat20/go-astilectron-bootstrap v0.0.0-20260919205804-5e3a314432f0 h1:89P3YOcmP3C3dhDd8zZSiHyYF917l2WrW006tSp4dxk=
+github.com/firebat20/go-astilectron-bootstrap v0.0.0-20260919205804-5e3a314432f0/go.mod h1:scJjauXm3JEVePfA7OxTatTtu0prC7Rl6xq9Q1uufMQ=
 github.com/firebat20/go-astilectron-bundler v0.0.0-20260919205123-4f96aba32a9b h1:7P9L65S34eyChT2X/UaKsDGSqnVYNppl+8BemDNlAk0=
 github.com/firebat20/go-astilectron-bundler v0.0.0-20260919205123-4f96aba32a9b/go.mod h1:IZ/Q3Xtjgjv38aS4LgqeofN+0IRJ1EJ5LIRl+HCaj5Y=
 github.com/firebat20/go-bindata v0.0.0-20260223060200-11071542feef h1:RzNiiaIMYiBQ57RAP4rkkPLi8OmLuyYJh0iPBOwRu4A=
