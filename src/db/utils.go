@@ -1,32 +1,48 @@
 package db
 
 import (
-	bytes2 "bytes"
 	"encoding/json"
 	"errors"
-	"go.uber.org/zap"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
+
+	"go.uber.org/zap"
 )
+
+// maxDownloadBytes caps how much data we will read from a remote URL. The
+// titles/versions JSON files are a few MB at most; anything wildly larger is
+// almost certainly a misconfigured or hostile endpoint. Because the download
+// URLs are user-editable in settings.json we treat the response as untrusted
+// and refuse to buffer an unbounded amount of it into memory.
+const maxDownloadBytes = 256 * 1024 * 1024 // 256 MB
+
+// httpTimeout bounds the *entire* request (connect + headers + body). The
+// previous implementation only set a dial timeout, so a server that accepted
+// the connection but then stalled the body would hang the app indefinitely.
+const httpTimeout = 60 * time.Second
 
 type ProgressUpdater interface {
 	UpdateProgress(curr int, total int, message string)
 }
 
-func LoadAndUpdateFile(url string, filePath string, etag string) (*os.File, string, error) {
+var sharedHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout: 3 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       60 * time.Second,
+	},
+	Timeout: httpTimeout,
+}
 
-	//create file if not exist
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		_, err = os.Create(filePath)
-		if err != nil {
-			zap.S().Errorf("Failed to create file %v - %v\n", filePath, err)
-			return nil, "", err
-		}
-	}
+func LoadAndUpdateFile(url string, filePath string, etag string) (*os.File, string, error) {
 
 	var file *os.File = nil
 
@@ -34,10 +50,8 @@ func LoadAndUpdateFile(url string, filePath string, etag string) (*os.File, stri
 	//if so, save the file
 	bytes, newEtag, err := downloadBytesFromUrl(url, etag)
 	if err == nil {
-		//validate json structure
-		var test map[string]interface{}
-		err = decodeToJsonObject(bytes2.NewReader(bytes), &test)
-		if err == nil {
+		//validate json structure without reflection-based allocations
+		if json.Valid(bytes) {
 			file, err = saveFile(bytes, filePath)
 			etag = newEtag
 		} else {
@@ -57,6 +71,7 @@ func LoadAndUpdateFile(url string, filePath string, etag string) (*os.File, stri
 
 		fileInfo, err := os.Stat(filePath)
 		if err != nil || fileInfo.Size() == 0 {
+			file.Close()
 			zap.S().Infof("Local file is empty, or corrupted")
 			return nil, "", errors.New("unable to download switch titles db")
 		}
@@ -75,31 +90,33 @@ func downloadBytesFromUrl(url string, etag string) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	req.Header.Set("If-None-Match", etag)
-	transport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout: 3 * time.Second,
-		}).DialContext,
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
 	}
-	client := http.Client{
-		Transport: transport,
-	}
-	resp, err := client.Do(req)
+	req.Header.Set("User-Agent", "switch-library-manager")
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return nil, "", err
 	}
 
+	defer resp.Body.Close()
+
 	if resp.StatusCode >= 400 {
 		return nil, "", errors.New("got a non 200 response - " + resp.Status)
 	}
-	defer resp.Body.Close()
 	//getting the new etag
 	etag = resp.Header.Get("Etag")
 
 	if resp.StatusCode == http.StatusOK {
-		body, err := ioutil.ReadAll(resp.Body)
+		// Bound the amount we read into memory. io.LimitReader with (max+1)
+		// lets us detect an over-limit body instead of silently truncating it.
+		limited := io.LimitReader(resp.Body, maxDownloadBytes+1)
+		body, err := io.ReadAll(limited)
 		if err != nil {
 			return nil, "", err
+		}
+		if int64(len(body)) > maxDownloadBytes {
+			return nil, "", errors.New("remote file exceeds maximum allowed size")
 		}
 		return body, etag, nil
 	}
@@ -107,10 +124,28 @@ func downloadBytesFromUrl(url string, etag string) ([]byte, string, error) {
 	return nil, "", errors.New("no new updates")
 }
 
-func saveFile(bytes []byte, fileName string) (*os.File, error) {
+func saveFile(data []byte, fileName string) (*os.File, error) {
 
-	err := ioutil.WriteFile(fileName, bytes, 0644)
+	dir := filepath.Dir(fileName)
+	tmp, err := os.CreateTemp(dir, ".tmp-*.json")
 	if err != nil {
+		return nil, err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return nil, err
+	}
+	if err := os.Chmod(tmpName, 0644); err != nil {
+		zap.S().Warnf("failed to chmod temp file: %v", err)
+	}
+	if err := os.Rename(tmpName, fileName); err != nil {
+		os.Remove(tmpName)
 		return nil, err
 	}
 

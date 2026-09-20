@@ -4,7 +4,7 @@ import (
 	"errors"
 	"os"
 
-	"github.com/trembon/switch-library-manager/switchfs"
+	"github.com/firebat20/switch-library-manager/switchfs"
 )
 
 func ReadSplitFileMetadata(filePath string) (map[string]*switchfs.ContentMetaAttributes, error) {
@@ -35,9 +35,12 @@ func readXciHeader(filePath string) ([]byte, error) {
 	defer file.Close()
 
 	header := make([]byte, 0x200)
-	_, err = file.Read(header)
+	n, err := file.Read(header)
 	if err != nil {
 		return nil, err
+	}
+	if n < 0x200 {
+		return nil, errors.New("file is too small to contain a valid XCI header")
 	}
 
 	if string(header[0x100:0x104]) != "HEAD" {

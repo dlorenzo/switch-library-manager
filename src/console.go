@@ -4,17 +4,16 @@ import (
 	"encoding/csv"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	"github.com/jedib0t/go-pretty/table"
+	"github.com/firebat20/switch-library-manager/console"
+	"github.com/firebat20/switch-library-manager/db"
+	"github.com/firebat20/switch-library-manager/process"
+	"github.com/firebat20/switch-library-manager/settings"
+	"github.com/jedib0t/go-pretty/v6/table"
 	"github.com/schollz/progressbar/v3"
-	"github.com/trembon/switch-library-manager/console"
-	"github.com/trembon/switch-library-manager/db"
-	"github.com/trembon/switch-library-manager/process"
-	"github.com/trembon/switch-library-manager/settings"
 	"go.uber.org/zap"
 )
 
@@ -41,13 +40,27 @@ func (c *Console) Start() {
 		csvOutput = c.consoleFlags.ExportCsv.String()
 
 		if _, err := os.Stat(csvOutput); os.IsNotExist(err) {
-			err = os.Mkdir(csvOutput, os.ModePerm)
+			err = os.MkdirAll(csvOutput, 0755)
 			if err != nil {
 				fmt.Printf("Failed to create folder for csv export %v - %v\n", csvOutput, err)
 				zap.S().Errorf("Failed to create folder for csv export %v - %v\n", csvOutput, err)
 			}
 		}
 	}
+
+	// Kick off the self-update check in the background so it overlaps with
+	// the titles/versions downloads below instead of serially blocking
+	// startup for up to 30s on a slow endpoint. The result is collected once
+	// the downloads finish.
+	type updateCheckResult struct {
+		newUpdate bool
+		err       error
+	}
+	updateCheckCh := make(chan updateCheckResult, 1)
+	go func() {
+		newUpdate, err := settings.CheckForUpdates()
+		updateCheckCh <- updateCheckResult{newUpdate: newUpdate, err: err}
+	}()
 
 	//1. load the titles JSON object
 	fmt.Println("Downloading latest switch titles json file")
@@ -71,9 +84,12 @@ func (c *Console) Start() {
 	settingsObj.VersionsEtag = versionsEtag
 	progressBar.Add(1)
 	progressBar.Finish()
-	newUpdate, err := settings.CheckForUpdates()
 
-	if newUpdate {
+	updateCheck := <-updateCheckCh
+	if updateCheck.err != nil {
+		zap.S().Debugf("update check failed: %v", updateCheck.err)
+	}
+	if updateCheck.newUpdate {
 		fmt.Printf("\n=== New version available, download from Github ===\n")
 	}
 
@@ -82,6 +98,13 @@ func (c *Console) Start() {
 
 	//4. create switch title db
 	titlesDB, err := db.CreateSwitchTitleDB(titleFile, versionsFile)
+	// This error was previously unchecked: a malformed titles/versions json
+	// left titlesDB nil, which panicked further down (len(titlesDB.TitlesMap)).
+	if err != nil {
+		fmt.Printf("\nfailed to process the titles/versions json files - %v\n", err)
+		zap.S().Errorf("failed to create switch title db: %v", err)
+		return
+	}
 
 	//5. read local files
 	folderToScan := settingsObj.Folder
@@ -95,9 +118,16 @@ func (c *Console) Start() {
 	}
 	fmt.Printf("\n\nScanning folder [%v]", folderToScan)
 	progressBar = progressbar.New(2000)
-	keys, _ := settings.InitSwitchKeys(c.baseFolder)
+	// The old message here interpolated the stale `err` from the titles-db
+	// step above, which printed a misleading (or nil) reason. Report the keys
+	// error itself instead.
+	keys, keysErr := settings.InitSwitchKeys(c.baseFolder)
 	if keys == nil || keys.GetKey("header_key") == "" {
-		fmt.Printf("\n!!NOTE!!: keys file was not found, deep scan is disabled, library will be based on file tags.\n %v", err)
+		fmt.Printf("\n!!NOTE!!: keys file was not found, deep scan is disabled, library will be based on file tags.")
+		if keysErr != nil {
+			fmt.Printf("\n %v", keysErr)
+		}
+		fmt.Println()
 	}
 
 	recursiveMode := settingsObj.ScanRecursively
@@ -112,7 +142,7 @@ func (c *Console) Start() {
 	}
 	defer localDbManager.Close()
 
-	scanFolders := settingsObj.ScanFolders
+	scanFolders := append([]string{}, settingsObj.ScanFolders...)
 	scanFolders = append(scanFolders, folderToScan)
 
 	localDB, err := localDbManager.CreateLocalSwitchFilesDB(scanFolders, c, recursiveMode, true)
@@ -122,9 +152,13 @@ func (c *Console) Start() {
 	}
 	progressBar.Finish()
 
-	p := (float32(len(localDB.TitlesMap)) / float32(len(titlesDB.TitlesMap))) * 100
-
-	fmt.Printf("Local library completion status: %.2f%% (have %d titles, out of %d titles)\n", p, len(localDB.TitlesMap), len(titlesDB.TitlesMap))
+	// Guard the percentage: an empty titles DB previously produced NaN/+Inf.
+	if len(titlesDB.TitlesMap) > 0 {
+		p := (float32(len(localDB.TitlesMap)) / float32(len(titlesDB.TitlesMap))) * 100
+		fmt.Printf("Local library completion status: %.2f%% (have %d titles, out of %d titles)\n", p, len(localDB.TitlesMap), len(titlesDB.TitlesMap))
+	} else {
+		fmt.Printf("Local library contains %d titles (titles DB is empty, completion status unavailable)\n", len(localDB.TitlesMap))
+	}
 
 	issuesCsvFile := ""
 	if csvOutput != "" {
@@ -135,7 +169,9 @@ func (c *Console) Start() {
 	if settingsObj.OrganizeOptions.DeleteOldUpdateFiles {
 		progressBar = progressbar.New(2000)
 		fmt.Printf("\nDeleting old updates\n")
-		process.DeleteOldUpdates(c.baseFolder, localDB, c)
+		// Clean within the library folder being organized, not the app's
+		// install directory (c.baseFolder).
+		process.DeleteOldUpdates(folderToScan, localDB, c)
 		progressBar.Finish()
 	}
 
@@ -186,12 +222,12 @@ func (c *Console) processIssues(localDB *db.LocalSwitchFilesDB, csvOutput string
 	t.AppendHeader(table.Row{"#", "Skipped file", "Reason"})
 	i := 0
 	for k, v := range localDB.Skipped {
-		csv.Write([]string{path.Join(k.BaseFolder, k.FileName), v.ReasonText, strconv.Itoa(v.ReasonCode)})
+		csv.Write([]string{filepath.Join(k.BaseFolder, k.FileName), v.ReasonText, strconv.Itoa(v.ReasonCode)})
 
-		t.AppendRow([]interface{}{i, path.Join(k.BaseFolder, k.FileName), v})
+		t.AppendRow([]interface{}{i, filepath.Join(k.BaseFolder, k.FileName), v})
 		i++
 	}
-	t.AppendFooter(table.Row{"", "", "", "", "Total", len(localDB.Skipped)})
+	t.AppendFooter(table.Row{"Total", len(localDB.Skipped)})
 	t.Render()
 
 	csv.Close()
@@ -224,7 +260,7 @@ func (c *Console) processMissingUpdates(localDB *db.LocalSwitchFilesDB, titlesDB
 		t.AppendRow([]interface{}{i, v.Attributes.Name, v.Attributes.Id, v.LocalUpdate, v.LatestUpdate, v.LatestUpdateDate})
 		i++
 	}
-	t.AppendFooter(table.Row{"", "", "", "", "Total", len(incompleteTitles)})
+	t.AppendFooter(table.Row{"Total", len(incompleteTitles)})
 	t.Render()
 
 	csv.Close()
@@ -259,13 +295,25 @@ func (c *Console) processMissingDLC(localDB *db.LocalSwitchFilesDB, titlesDB *db
 		t.AppendRow([]interface{}{i, v.Attributes.Name, v.Attributes.Id, strings.Join(v.MissingDLC, "\n")})
 		i++
 	}
-	t.AppendFooter(table.Row{"", "", "", "", "Total", len(incompleteTitles)})
+	t.AppendFooter(table.Row{"Total", len(incompleteTitles)})
 	t.Render()
 
 	csv.Close()
 }
 
 func (c *Console) UpdateProgress(curr int, total int, message string) {
+	if progressBar == nil {
+		return
+	}
+	if total <= 0 {
+		return
+	}
+	if curr < 0 {
+		curr = 0
+	}
+	if curr > total {
+		curr = total
+	}
 	progressBar.ChangeMax(total)
 	progressBar.Set(curr)
 }
@@ -277,10 +325,19 @@ type CsvFile struct {
 
 func CreateCsvFile(output string, header []string) *CsvFile {
 	if output != "" {
-		file, _ := os.Create(output)
+		file, err := os.Create(output)
+		if err != nil {
+			fmt.Printf("Failed to create CSV file %v - %v\n", output, err)
+			zap.S().Errorf("Failed to create CSV file %v - %v\n", output, err)
+			return nil
+		}
 		writer := csv.NewWriter(file)
 
-		_ = writer.Write(header)
+		if err := writer.Write(header); err != nil {
+			zap.S().Errorf("Failed to write CSV header %v - %v", output, err)
+			file.Close()
+			return nil
+		}
 
 		instance := &CsvFile{Writer: writer, File: file}
 		return instance
@@ -291,13 +348,35 @@ func CreateCsvFile(output string, header []string) *CsvFile {
 
 func (csv *CsvFile) Close() {
 	if csv != nil {
-		csv.Writer.Flush()
-		csv.File.Close()
+		if csv.Writer != nil {
+			csv.Writer.Flush()
+			if err := csv.Writer.Error(); err != nil {
+				zap.S().Errorf("Failed to flush CSV: %v", err)
+			}
+		}
+		if csv.File != nil {
+			if err := csv.File.Close(); err != nil {
+				zap.S().Errorf("Failed to close CSV: %v", err)
+			}
+		}
 	}
 }
 
+func sanitizeCSVField(s string) string {
+	if s != "" && (s[0] == '=' || s[0] == '+' || s[0] == '-' || s[0] == '@') {
+		return "'" + s
+	}
+	return s
+}
+
 func (csv *CsvFile) Write(row []string) {
-	if csv != nil {
-		_ = csv.Writer.Write(row)
+	if csv != nil && csv.Writer != nil {
+		safe := make([]string, len(row))
+		for i, v := range row {
+			safe[i] = sanitizeCSVField(v)
+		}
+		if err := csv.Writer.Write(safe); err != nil {
+			zap.S().Errorf("Failed to write CSV row: %v", err)
+		}
 	}
 }

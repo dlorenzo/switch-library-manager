@@ -3,6 +3,7 @@ package switchfs
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -23,7 +24,7 @@ type fileEntry struct {
 type PFS0 struct {
 	Filepath  string
 	Size      uint64
-	HeaderLen uint16
+	HeaderLen uint32
 	Files     []fileEntry
 }
 
@@ -46,11 +47,13 @@ func ReadPfs0File(filePath string) (*PFS0, error) {
 }
 
 func readPfs0(reader io.ReaderAt, offset int64) (*PFS0, error) {
-
+	if offset < 0 {
+		return nil, fmt.Errorf("invalid PFS0 offset %d", offset)
+	}
 	header := make([]byte, 0xC)
 	n, err := reader.ReadAt(header, offset)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read PFS0 header: %w", err)
 	}
 	if n != 0xC {
 		return nil, errors.New("failed to read file")
@@ -66,40 +69,80 @@ func readPfs0(reader io.ReaderAt, offset int64) (*PFS0, error) {
 	p := &PFS0{}
 
 	fileCount := binary.LittleEndian.Uint16(header[0x4:0x8])
-
-	fileEntryTableOffset := 0x10 + (fileEntryTableSize * fileCount)
-
 	stringsLen := binary.LittleEndian.Uint16(header[0x8:0xC])
-	p.HeaderLen = fileEntryTableOffset + stringsLen
+
+	// Compute the entry-table offset in a wide int so a large fileCount cannot
+	// silently overflow (the original uint16 math could wrap and produce a tiny
+	// offset, leading to out-of-range reads/panics later).
+	fileEntryTableOffset := int64(0x10) + int64(fileEntryTableSize)*int64(fileCount)
+
+	if fileEntryTableOffset+int64(stringsLen) > 0x7fffffff {
+		return nil, errors.New("invalid PFS0/HFS0 header: implausible size")
+	}
+	if fileEntryTableOffset+int64(stringsLen) > 0xFFFFFF {
+		return nil, errors.New("invalid PFS0/HFS0 header: header too large")
+	}
+	p.HeaderLen = uint32(fileEntryTableOffset) + uint32(stringsLen)
 	fileNamesBuffer := make([]byte, stringsLen)
-	_, err = reader.ReadAt(fileNamesBuffer, offset+int64(fileEntryTableOffset))
+	n, err = reader.ReadAt(fileNamesBuffer, offset+fileEntryTableOffset)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read PFS0 names: %w", err)
+	}
+	if n != int(stringsLen) && stringsLen != 0 {
+		return nil, fmt.Errorf("short read of PFS0 names: got %d want %d", n, stringsLen)
+	}
+
+	// Read the whole file-entry table in a single ReadAt instead of one call
+	// per entry. NSP/HFS0 partitions can contain hundreds of entries, and each
+	// ReadAt is a syscall (or, for split files, potentially a part lookup), so
+	// this collapses O(fileCount) reads into one. The size is bounded: uint16
+	// fileCount * 0x40 max entry size = 4 MB worst case, and the header
+	// plausibility check above already rejected anything larger.
+	entryTableBytes := make([]byte, int64(fileEntryTableSize)*int64(fileCount))
+	if len(entryTableBytes) > 0 {
+		n, err = reader.ReadAt(entryTableBytes, offset+0x10)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read PFS0 entries: %w", err)
+		}
+		if n != len(entryTableBytes) {
+			return nil, fmt.Errorf("short read of PFS0 entries: got %d want %d", n, len(entryTableBytes))
+		}
 	}
 
 	p.Files = make([]fileEntry, fileCount)
 	// go over the fileEntries
 	for i := uint16(0); i < fileCount; i++ {
-		fileEntryTable := make([]byte, fileEntryTableSize)
-		_, err = reader.ReadAt(fileEntryTable, offset+int64(0x10+(fileEntryTableSize*i)))
-		if err != nil {
-			return nil, err
-		}
+		entryStart := int(i) * int(fileEntryTableSize)
+		fileEntryTable := entryTableBytes[entryStart : entryStart+int(fileEntryTableSize)]
 
 		fileOffset := binary.LittleEndian.Uint64(fileEntryTable[0:8])
 		fileSize := binary.LittleEndian.Uint64(fileEntryTable[8:16])
+		if fileOffset+uint64(p.HeaderLen) < fileOffset {
+			return nil, errors.New("invalid PFS0/HFS0 file entry: offset overflow")
+		}
+
+		// The name offset is read straight from the file; bound it against the
+		// actual string table before slicing to avoid an out-of-range panic.
+		nameOffset := binary.LittleEndian.Uint32(fileEntryTable[16:20])
+		if nameOffset >= uint32(len(fileNamesBuffer)) && len(fileNamesBuffer) > 0 {
+			return nil, errors.New("invalid PFS0/HFS0 file entry: name offset out of range")
+		}
 		var nameBytes []byte
-		for _, b := range fileNamesBuffer[binary.LittleEndian.Uint16(fileEntryTable[16:20]):] {
+		foundNul := false
+		for _, b := range fileNamesBuffer[nameOffset:] {
 			if b == 0x0 {
+				foundNul = true
 				break
 			} else {
 				nameBytes = append(nameBytes, b)
 			}
 		}
+		if len(fileNamesBuffer) > 0 && !foundNul && len(nameBytes) == len(fileNamesBuffer[int(nameOffset):]) {
+			return nil, errors.New("invalid PFS0/HFS0 file entry: unterminated name")
+		}
 
 		p.Files[i] = fileEntry{fileOffset + uint64(p.HeaderLen), fileSize, string(nameBytes)}
 	}
-	p.HeaderLen += stringsLen
 
 	return p, nil
 }

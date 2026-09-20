@@ -4,19 +4,19 @@ runs:
   using: composite
   steps:
     - name: Set up Go
-      uses: actions/setup-go@v4
+      uses: actions/setup-go@v5
       with:
-        go-version: "1.24"
+        go-version: "1.26"
+        cache-dependency-path: src/go.sum
 
-    - name: Get bundler
-      working-directory: ./src
-      shell: bash
-      run: go get -u github.com/asticode/go-astilectron-bundler/
-
+    # Install the bundler from the version already pinned in go.mod/go.sum.
+    # (Previously this ran `go get -u github.com/firebat20/go-astilectron-bundler/`,
+    # which mutated go.mod/go.sum on every CI run and pulled unpinned latest
+    # versions of transitive dependencies — a source of nondeterministic breakage.)
     - name: Install bundler
       working-directory: ./src
       shell: bash
-      run: go install github.com/asticode/go-astilectron-bundler/astilectron-bundler
+      run: go install github.com/firebat20/go-astilectron-bundler/astilectron-bundler
 
     - name: Move bundler
       working-directory: ./src

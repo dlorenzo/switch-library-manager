@@ -4,11 +4,11 @@ Fork of [Switch Library Manager](https://github.com/giwty/switch-library-manager
 
 Easily manage your switch game backups
 
-![Image description](https://raw.githubusercontent.com/trembon/switch-library-manager/master/.github/readme/updates_ui.png)
+![Image description](https://raw.githubusercontent.com/firebat20/switch-library-manager/master/.github/readme/updates_ui.png)
 
-![Image description](https://raw.githubusercontent.com/trembon/switch-library-manager/master/.github/readme/dlc_ui.png)
+![Image description](https://raw.githubusercontent.com/firebat20/switch-library-manager/master/.github/readme/dlc_ui.png)
 
-![Image description](https://raw.githubusercontent.com/trembon/switch-library-manager/master/.github/readme/cmd.png)
+![Image description](https://raw.githubusercontent.com/firebat20/switch-library-manager/master/.github/readme/cmd.png)
 
 ## Features
 
@@ -130,7 +130,7 @@ NOTE: parameters are only usable in command line mode, except the parameter -m (
 
 ### Windows
 - Install and setup Go
-- Clone the repo: `git clone https://github.com/trembon/switch-library-manager.git`
+- Clone the repo: `git clone https://github.com/firebat20/switch-library-manager.git`
 - Move into the src folder `cd src`
 - Get the bundler `go get -u github.com/asticode/go-astilectron-bundler/...`
 - Install bundler `go install github.com/asticode/go-astilectron-bundler/astilectron-bundler`
@@ -140,7 +140,7 @@ NOTE: parameters are only usable in command line mode, except the parameter -m (
 
 ### macOS or Linux
 - Install and setup Go
-- Clone the repo: `git clone https://github.com/trembon/switch-library-manager.git`
+- Clone the repo: `git clone https://github.com/firebat20/switch-library-manager.git`
 - Move into the src folder `cd src`
 - Get the bundler `go get -u github.com/asticode/go-astilectron-bundler/...`
 - Install bundler `go install github.com/asticode/go-astilectron-bundler/astilectron-bundler`

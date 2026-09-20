@@ -2,8 +2,10 @@ package settings
 
 import (
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/magiconair/properties"
 	"go.uber.org/zap"
@@ -11,6 +13,7 @@ import (
 
 var (
 	keysInstance *switchKeys
+	keysMu       sync.RWMutex
 )
 
 type switchKeys struct {
@@ -18,10 +21,18 @@ type switchKeys struct {
 }
 
 func (k *switchKeys) GetKey(keyName string) string {
-	return k.keys[keyName]
+	if k == nil || k.keys == nil {
+		return ""
+	}
+	return k.keys[strings.ToLower(keyName)]
 }
 
 func SwitchKeys() (*switchKeys, error) {
+	keysMu.RLock()
+	defer keysMu.RUnlock()
+	if keysInstance == nil {
+		return nil, errors.New("prod.keys not loaded")
+	}
 	return keysInstance, nil
 }
 
@@ -37,7 +48,7 @@ func InitSwitchKeys(baseFolder string) (*switchKeys, error) {
 	settings := ReadSettings(baseFolder)
 	if settings.Prodkeys != "" {
 		path = settings.Prodkeys
-		if !strings.HasSuffix(path, ".keys") {
+		if !strings.HasSuffix(strings.ToLower(path), ".keys") {
 			path = filepath.Join(path, "prod.keys")
 		}
 
@@ -57,10 +68,13 @@ func InitSwitchKeys(baseFolder string) (*switchKeys, error) {
 
 	// third, if not found in current, look in home directory
 	if err != nil {
-		path = "${HOME}/.switch/prod.keys"
-
-		logger.Infof("Trying to load prod.keys based on home directory: %v", path)
-		p, err = properties.LoadFile(path, properties.UTF8)
+		if home, herr := os.UserHomeDir(); herr == nil {
+			path = filepath.Join(home, ".switch", "prod.keys")
+			logger.Infof("Trying to load prod.keys based on home directory: %v", path)
+			p, err = properties.LoadFile(path, properties.UTF8)
+		} else {
+			logger.Infof("Unable to resolve home directory: %v", herr)
+		}
 	}
 
 	if err != nil {
@@ -68,12 +82,16 @@ func InitSwitchKeys(baseFolder string) (*switchKeys, error) {
 		return nil, errors.New("Error trying to read prod.keys [reason:" + err.Error() + "]")
 	}
 
-	keysInstance = &switchKeys{keys: map[string]string{}}
+	loaded := &switchKeys{keys: map[string]string{}}
 	for _, key := range p.Keys() {
 		value, _ := p.Get(key)
-		keysInstance.keys[key] = value
+		loaded.keys[strings.ToLower(key)] = value
 	}
 
-	logger.Infof("Loaded prod.keys from: %v", path)
-	return keysInstance, nil
+	keysMu.Lock()
+	keysInstance = loaded
+	keysMu.Unlock()
+
+	zap.S().Info("Loaded prod.keys")
+	return loaded, nil
 }

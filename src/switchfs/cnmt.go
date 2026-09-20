@@ -63,7 +63,14 @@ func readBinaryCnmt(pfs0 *PFS0, data []byte) (*ContentMetaAttributes, error) {
 		return nil, errors.New("unexpected pfs0")
 	}
 	cnmtFile := pfs0.Files[0]
-	cnmt := data[int64(cnmtFile.StartOffset):]
+	if cnmtFile.StartOffset > uint64(len(data)) {
+		return nil, errors.New("invalid cnmt: start offset out of range")
+	}
+	cnmt := data[int(cnmtFile.StartOffset):]
+	// The cnmt header is 0x20 bytes; require at least that before reading fixed fields.
+	if len(cnmt) < 0x20 {
+		return nil, errors.New("invalid cnmt: truncated header")
+	}
 	titleId := binary.LittleEndian.Uint64(cnmt[0:0x8])
 	version := binary.LittleEndian.Uint32(cnmt[0x8:0xC])
 	tableOffset := binary.LittleEndian.Uint16(cnmt[0xE:0x10])
@@ -71,7 +78,12 @@ func readBinaryCnmt(pfs0 *PFS0, data []byte) (*ContentMetaAttributes, error) {
 	//metaEntryCount := binary.LittleEndian.Uint16(cnmt[0x12:0x14])
 	contents := map[string]Content{}
 	for i := uint16(0); i < contentEntryCount; i++ {
-		position := 0x20 /*size of cnmt header*/ + tableOffset + (i * uint16(0x38))
+		// Compute the entry position in a wide int so the uint16 math cannot wrap,
+		// then bound-check against the buffer before slicing.
+		position := int(0x20) /*size of cnmt header*/ + int(tableOffset) + int(i)*0x38
+		if position+0x38 > len(cnmt) || position < 0 {
+			return nil, errors.New("invalid cnmt: content entry out of range")
+		}
 		ncaId := cnmt[position+0x20 : position+0x20+0x10]
 		//fmt.Println(fmt.Sprintf("0%x", ncaId))
 		contentType := ""
@@ -90,6 +102,8 @@ func readBinaryCnmt(pfs0 *PFS0, data []byte) (*ContentMetaAttributes, error) {
 			contentType = "LegalInformation"
 		case 6:
 			contentType = "DeltaFragment"
+		default:
+			return nil, fmt.Errorf("invalid cnmt: unknown content type %d", cnmt[position+0x36])
 		}
 		contents[contentType] = Content{ID: fmt.Sprintf("%x", ncaId)}
 	}
@@ -101,9 +115,11 @@ func readBinaryCnmt(pfs0 *PFS0, data []byte) (*ContentMetaAttributes, error) {
 		metaType = "DLC"
 	case ContentMetaType_Patch:
 		metaType = "UPD"
+	default:
+		return nil, fmt.Errorf("invalid cnmt: unknown meta type 0x%x", cnmt[0xC])
 	}
 
-	return &ContentMetaAttributes{Contents: contents, Version: int(version), TitleId: fmt.Sprintf("0%x", titleId), Type: metaType}, nil
+	return &ContentMetaAttributes{Contents: contents, Version: int(version), TitleId: fmt.Sprintf("%016x", titleId), Type: metaType}, nil
 }
 
 func readXmlCnmt(xmlBytes []byte) (*ContentMetaAttributes, error) {

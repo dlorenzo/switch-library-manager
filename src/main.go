@@ -8,8 +8,8 @@ import (
 	"runtime"
 	"strings"
 
-	"github.com/trembon/switch-library-manager/console"
-	"github.com/trembon/switch-library-manager/settings"
+	"github.com/firebat20/switch-library-manager/console"
+	"github.com/firebat20/switch-library-manager/settings"
 	"go.uber.org/zap"
 )
 
@@ -23,10 +23,16 @@ func main() {
 	workingFolder := filepath.Dir(exePath)
 
 	if runtime.GOOS == "darwin" {
-		if strings.Contains(workingFolder, ".app") {
-			appIndex := strings.Index(workingFolder, ".app")
-			sepIndex := strings.LastIndex(workingFolder[:appIndex], string(os.PathSeparator))
-			workingFolder = workingFolder[:sepIndex]
+		if idx := strings.Index(workingFolder, ".app/"); idx >= 0 {
+			sepIndex := strings.LastIndex(workingFolder[:idx], string(os.PathSeparator))
+			if sepIndex > 0 {
+				workingFolder = workingFolder[:sepIndex]
+			}
+		} else if strings.HasSuffix(workingFolder, ".app") {
+			sepIndex := strings.LastIndex(filepath.Dir(workingFolder), string(os.PathSeparator))
+			if sepIndex > 0 {
+				workingFolder = workingFolder[:sepIndex]
+			}
 		}
 	}
 
@@ -41,8 +47,9 @@ func main() {
 	sugar.Infof("[Executable: %v]", exePath)
 	sugar.Infof("[Working directory: %v]", workingFolder)
 
-	files, err := AssetDir(workingFolder)
-	if files == nil && err == nil {
+	if AssetDir == nil {
+		appSettings.GUI = false
+	} else if files, err := AssetDir("resources/app"); err != nil || len(files) == 0 {
 		appSettings.GUI = false
 	}
 
@@ -69,11 +76,10 @@ func main() {
 }
 
 func createLogger(workingFolder string, debug bool) *zap.Logger {
-	var config zap.Config
+	config := zap.NewDevelopmentConfig()
 	if debug {
-		config = zap.NewDevelopmentConfig()
+		config.Level = zap.NewAtomicLevelAt(zap.DebugLevel)
 	} else {
-		config = zap.NewDevelopmentConfig()
 		config.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
 	}
 	logPath := filepath.Join(workingFolder, "slm.log")
@@ -83,17 +89,24 @@ func createLogger(workingFolder string, debug bool) *zap.Logger {
 	if runtime.GOOS == "windows" {
 		zap.RegisterSink("winfile", func(u *url.URL) (zap.Sink, error) {
 			// Remove leading slash left by url.Parse()
-			return os.OpenFile(u.Path[1:], os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0644)
+			p := u.Path
+			if len(p) > 0 && p[0] == '/' {
+				p = p[1:]
+			}
+			if p == "" {
+				return nil, fmt.Errorf("invalid log path")
+			}
+			return os.OpenFile(p, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0600)
 		})
-		logPath = "winfile:///" + logPath
+		logPath = "winfile:///" + filepath.ToSlash(logPath)
 	}
 
 	config.OutputPaths = []string{logPath}
-	config.ErrorOutputPaths = []string{logPath}
+	config.ErrorOutputPaths = []string{"stderr"}
 	logger, err := config.Build()
 	if err != nil {
-		fmt.Printf("failed to create logger - %v", err)
-		panic(1)
+		fmt.Printf("failed to create logger - %v\n", err)
+		os.Exit(1)
 	}
 	zap.ReplaceGlobals(logger)
 	return logger

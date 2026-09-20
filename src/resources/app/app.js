@@ -1,4 +1,97 @@
-const { shell, dialog } = require('electron').remote
+// --- UI & IPC Helpers (Electron remote module disabled) -------------------
+function safeParse(payload, fallback) {
+    try {
+        if (!payload) return fallback;
+        return JSON.parse(payload);
+    } catch (e) {
+        console.error("Failed to parse IPC payload", e);
+        return fallback;
+    }
+}
+function showMessageBox(options, callback) {
+    let title = (options && options.title) ? options.title : "";
+    let msg = (options && options.message) ? options.message : "";
+    let detail = (options && options.detail) ? options.detail : "";
+    let text = [title, msg, detail].filter(Boolean).join("\n\n");
+
+    if (options && options.buttons && options.buttons.length > 1) {
+        let choice = window.confirm(text);
+        let result = { response: choice ? 0 : 1 };
+        if (callback) callback(result);
+        return Promise.resolve(result);
+    } else {
+        window.alert(text);
+        let result = { response: 0 };
+        if (callback) callback(result);
+        return Promise.resolve(result);
+    }
+}
+
+function openFolderPickerHelper(mode, updateFolderFunc) {
+    let picker = document.getElementById("folder-picker-hidden-input");
+    if (!picker) {
+        picker = document.createElement("input");
+        picker.type = "file";
+        picker.id = "folder-picker-hidden-input";
+        picker.webkitdirectory = true;
+        picker.style.display = "none";
+        document.body.appendChild(picker);
+    }
+    picker.onchange = function (e) {
+        if (e.target.files && e.target.files.length > 0) {
+            let firstFile = e.target.files[0];
+            let fullPath = firstFile.path || "";
+            if (fullPath) {
+                let dirPath = fullPath.substring(0, Math.max(fullPath.lastIndexOf('/'), fullPath.lastIndexOf('\\')));
+                if (dirPath) {
+                    updateFolderFunc(mode, { canceled: false, filePaths: [dirPath] });
+                }
+            }
+        }
+        picker.value = "";
+    };
+    picker.click();
+}
+
+function showItemInFolderHelper(filePath) {
+    if (filePath && window.astilectron) {
+        astilectron.sendMessage({ name: "showItemInFolder", payload: filePath });
+    }
+}
+
+// --- Security helpers -------------------------------------------------------
+// Title names, DLC names and icon URLs originate from remotely-downloaded data
+// (titles.json / versions.json, whose URLs are user-editable) and from NACP
+// metadata embedded in scanned game files. None of it is trusted. The table
+// formatters below build HTML by string interpolation, so every interpolated
+// value MUST be escaped, and any URL used in an attribute must be restricted to
+// safe schemes. Without this, a crafted title such as
+//   <img src=x onerror=...>
+// would execute in the renderer (which, with the remote module enabled, can
+// reach Node APIs).
+
+// Escape the five HTML-significant characters so a value can be safely placed
+// in element text or inside a double-quoted attribute.
+function escapeHtml(value) {
+    if (value === null || value === undefined) return "";
+    return String(value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+}
+
+// Only allow http/https/data-image URLs for <img src>. Anything else
+// (javascript:, vbscript:, file:, etc.) is dropped. The result is still passed
+// through escapeHtml before being placed in the attribute.
+function sanitizeImageUrl(url) {
+    if (!url) return "";
+    const trimmed = String(url).trim();
+    if (/^https?:\/\//i.test(trimmed)) return trimmed;
+    if (/^data:image\//i.test(trimmed)) return trimmed;
+    return "";
+}
 
 $(function () {
 
@@ -12,9 +105,13 @@ $(function () {
     // Fluent UI formatter for Title + Thumbnail
     const fluentTitleFormatter = function(cell, formatterParams, onRendered){
         const data = cell.getRow().getData();
-        const imgSrc = data.icon || (data.Attributes && data.Attributes.bannerUrl) || null;
-        const title = data.name || (data.Attributes && data.Attributes.name) || 'Unknown Title';
-        
+        const rawImg = data.icon || (data.Attributes && data.Attributes.bannerUrl) || null;
+        const rawTitle = data.name || (data.Attributes && data.Attributes.name) || 'Unknown Title';
+
+        // Untrusted: escape text, restrict + escape the URL.
+        const title = escapeHtml(rawTitle);
+        const imgSrc = escapeHtml(sanitizeImageUrl(rawImg));
+
         if (imgSrc) {
             return `<div style="display:flex; align-items:center; gap: 12px; padding: 4px 0;">
                       <img src="${imgSrc}" style="width: 52px; height: 52px; border-radius: 6px; object-fit: cover; box-shadow: 0 2px 6px rgba(0,0,0,0.15);">
@@ -34,9 +131,10 @@ $(function () {
         const normalizedPath = fullPath.replace(/\\/g, '/');
         const parts = normalizedPath.split('/');
         
-        const fileName = parts.pop();
-        const dirName = parts.join('/') || "/";
-        
+        // Escape for use in both element text and the title="" attribute.
+        const fileName = escapeHtml(parts.pop());
+        const dirName = escapeHtml(parts.join('/') || "/");
+
         return `<div style="display:flex; flex-direction:column; justify-content:center; padding: 4px 0; cursor: pointer;">
                   <div style="font-weight: 500; font-size: 13px; color: var(--fluent-text, inherit); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;" title="${fileName}">${fileName}</div>
                   <div style="font-weight: 400; font-size: 11px; color: #888; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%;" title="${dirName}">${dirName}</div>
@@ -53,7 +151,7 @@ $(function () {
         // Restore Maximized State from backend settings
         astilectron.sendMessage({name: "checkMaximized", payload: ""}, function(message) {
             if (message === "true") {
-                try { require('electron').remote.getCurrentWindow().maximize(); } catch(e){}
+                try { astilectron.sendMessage({name: "maximizeWindow", payload: ""}); } catch(e){}
             }
         });
 
@@ -62,7 +160,8 @@ $(function () {
         };
 
         sendMessage("loadSettings", "", function (message) {
-            state.settings = JSON.parse(message);
+            state.settings = safeParse(message, {}) || {};
+            state.settings.organize_options = state.settings.organize_options || {};
 
             if(state.settings.hide_missing_games){
                 document.getElementById("tab_btns").classList.add("hide_missing_games");
@@ -72,13 +171,11 @@ $(function () {
             if(state.settings.dark_mode) {
                 document.body.classList.add("bootstrap-dark");
                 document.body.classList.remove("bootstrap");
-                try { require('electron').remote.nativeTheme.themeSource = 'dark'; } catch(e){}
                 $('meta[name="color-scheme"]').attr("content", "dark");
                 $("#toggle-dark-mode").text("☀️");
             } else {
                 document.body.classList.add("bootstrap");
                 document.body.classList.remove("bootstrap-dark");
-                try { require('electron').remote.nativeTheme.themeSource = 'light'; } catch(e){}
                 $('meta[name="color-scheme"]').attr("content", "light");
                 $("#toggle-dark-mode").text("🌙");
             }
@@ -92,13 +189,13 @@ $(function () {
             if (message === "false"){
                 return
             }
-            dialog.showMessageBox(null, {
+            showMessageBox({
                 type: 'info',
                 buttons: ['Ok'],
                 defaultId: 0,
                 title: 'New update available',
                 message: 'There is a new update available, please download from Github',
-                detail: message.payload
+                detail: 'Visit github.com/firebat20/switch-library-manager/releases to download the latest version.'
             });
         });
 
@@ -114,12 +211,15 @@ $(function () {
             // console.log(message)
             let pcg = 0
             if (message.name === "updateProgress") {
-                let pp = JSON.parse(message.payload);
-                let count = pp.curr;
-                let total = pp.total;
-                $('.progress-msg').text(pp.message);
-                if (count !== -1 && total !== -1){
+                let pp = safeParse(message.payload, null);
+                if (!pp) return;
+                let count = Number(pp.curr) || 0;
+                let total = Number(pp.total) || 0;
+                $('.progress-msg').text(String(pp.message || ""));
+                if (total > 0){
                     pcg = Math.floor(count / total * 100);
+                    if (!isFinite(pcg) || pcg < 0) pcg = 0;
+                    if (pcg > 100) pcg = 100;
                     $('.progress-bar').attr('aria-valuenow', pcg);
                     $('.progress-bar').attr('style', 'width:' + Number(pcg) + '%');
                     $('.progress-bar').text(pcg + "%");
@@ -131,15 +231,19 @@ $(function () {
                 }
             }
             else if (message.name === "libraryLoaded") {
-                state.library = JSON.parse(message.payload);
+                state.library = safeParse(message.payload, null);
+                if (!state.library || !Array.isArray(state.library.library_data)) {
+                    state.library = { library_data: [], issues: [], num_files: 0 };
+                }
                 loadTab("#library")
             }
             else if (message.name === "missingGames") {
-                state.missingGames = JSON.parse(message.payload);
+                state.missingGames = safeParse(message.payload, []);
+                if (!Array.isArray(state.missingGames)) state.missingGames = [];
                 loadTab("#missing")
             }
             else if (message.name === "error") {
-                dialog.showMessageBox(null, {
+                showMessageBox({
                     type: 'error',
                     buttons: ['Ok'],
                     defaultId: 0,
@@ -160,12 +264,7 @@ $(function () {
         });
 
         let openFolderPicker = function (mode) {
-            //show info
-            dialog.showOpenDialog({
-                properties: ['openDirectory'],
-                message:"Select games folder"
-            }).then(partial(updateFolder,mode))
-                .catch(error => console.log(error))
+            openFolderPickerHelper(mode, updateFolder);
         };
 
         let scanLocalFolder = function(mode){
@@ -226,12 +325,13 @@ $(function () {
                 let html = $(target + "Template").render({folder: state.settings.folder,settings:state.settings})
                 $(target).html(html);
             } else if (target === "#updates") {
+                if (!state.settings) return;
                 if (state.settings.folder && !state.library){
                     return
                 }
                 if (state.library && !state.updates){
                     sendMessage("missingUpdates", "", (r => {
-                        state.updates = JSON.parse(r)
+                        state.updates = safeParse(r, [])
                         loadTab("#updates")
                     }));
                     return
@@ -245,7 +345,7 @@ $(function () {
                             {column:"latest_update_date", dir:"desc"}, //sort by this first
                         ],
                         pagination: "local",
-                        paginationSize: state.settings.gui_page_size,
+                        paginationSize: state.settings.gui_page_size > 0 ? state.settings.gui_page_size : 100,
                         data: state.updates,
                         columns: [
                             {title: "Game", field: "Attributes.name", headerFilter:"input", formatter:fluentTitleFormatter, width:400},
@@ -258,12 +358,13 @@ $(function () {
                     });
                 }
             } else if (target === "#dlc") {
+                if (!state.settings) return;
                 if (state.settings.folder && !state.library){
                     return
                 }
                 if (state.library && !state.dlc){
                     sendMessage("missingDlc", "", (r => {
-                        state.dlc = JSON.parse(r)
+                        state.dlc = safeParse(r, [])
                         loadTab("#dlc")
                     }));
                     return
@@ -283,10 +384,12 @@ $(function () {
                             {title: "Game", field: "Attributes.name", headerFilter:"input",formatter:fluentTitleFormatter, width:400},
                             {title: "# Missing", field: "missing_dlc.length"},
                             {title: "Missing DLC", headerSort:false, field: "missing_dlc",formatter:function(cell, formatterParams, onRendered){
-                                    value = ""
-                                    for (var i in cell.getValue())
+                                    // DLC names are untrusted; escape each one.
+                                    let value = ""
+                                    const list = cell.getValue() || []
+                                    for (var i in list)
                                     {
-                                        value +="<div>"+cell.getValue()[i]+"</div>"
+                                        value +="<div>"+escapeHtml(list[i])+"</div>"
                                     }
                                     return value
                                 }}
@@ -355,12 +458,15 @@ $(function () {
                             {title: "File name",width:500, headerSort:false, field: "key",formatter:fluentFileFormatter,cellClick:function(e, cell){
                                     //e - the click event object
                                     //cell - cell component
-                                    shell.showItemInFolder(cell.getData().key)
+                                    showItemInFolderHelper(cell.getData().key)
                                 }
                             },
                             {
                                 title: "Issue", field: "value", formatter: function (cell) {
-                                    return cell.getValue()
+                                    // The issue text embeds file paths (untrusted). Escape first,
+                                    // THEN turn the known literal markers into markup, so escaping
+                                    // can't neutralise our own <br/>/<strong> tags.
+                                    return escapeHtml(cell.getValue())
                                         .replaceAll("\nNew: ", "<br/><strong style='color:#0078D4; margin-top:8px; display:inline-block'>New:</strong> ")
                                         .replaceAll("\nOld: ", "<br/><strong style='color:#E81123; margin-top:4px; display:inline-block'>Old:</strong> ")
                                         .replaceAll("\nExisting: ", "<br/><strong style='color:#0078D4; margin-top:8px; display:inline-block'>Existing:</strong> ")
@@ -404,7 +510,7 @@ $(function () {
                             {title: "File name", headerSort:false, field: "path",formatter:fluentFileFormatter,cellClick:function(e, cell){
                                     //e - the click event object
                                     //cell - cell component
-                                    shell.showItemInFolder(cell.getData().path)
+                                    showItemInFolderHelper(cell.getData().path)
                                 }
                             }
                         ],
@@ -416,7 +522,7 @@ $(function () {
                 }
                 if (state.library && !state.missingGames){
                     sendMessage("missingGames", "", (r => {
-                        state.missingGames = JSON.parse(r)
+                        state.missingGames = safeParse(r, [])
                         loadTab("#missing")
                     }));
                     return
@@ -516,10 +622,7 @@ $(function () {
             sendMessage("saveSettings", JSON.stringify(state.settings), function() {
                 if (state.settings.organize_options.create_folder_per_game === false &&
                     state.settings.organize_options.rename_files === false){
-                    dialog.showMessageBox(null, {
-                        type: 'info',
-                        buttons: ['Ok'],
-                        defaultId: 0,
+                    showMessageBox({
                         title: 'Library organization is turned off',
                         message: 'Both rename files and create folders are disabled.',
                         detail: "You must enable at least one of these options to organize."
@@ -536,7 +639,7 @@ $(function () {
                     detail: 'This action will modify your local library files based on the settings you just chose.',
                 };
 
-                dialog.showMessageBox(null, options).then( (r) => {
+                showMessageBox(options).then( (r) => {
                     if (r.response === 0) {
                         $('.tabgroup > div').hide();
                         $(".progress-container").show();
@@ -549,10 +652,7 @@ $(function () {
                             state.dlc = undefined;
                             loadTab("#library");
                             scanLocalFolder(true);
-                            dialog.showMessageBox(null, {
-                                type: 'info',
-                                buttons: ['Ok'],
-                                defaultId: 0,
+                            showMessageBox({
                                 title: 'Success',
                                 message: 'Operation completed successfully'
                             });
@@ -567,10 +667,7 @@ $(function () {
             e.preventDefault();
             if (state.settings.organize_options.create_folder_per_game === false &&
                 state.settings.organize_options.rename_files === false){
-                dialog.showMessageBox(null, {
-                    type: 'info',
-                    buttons: ['Ok'],
-                    defaultId: 0,
+                showMessageBox({
                     title: 'Library organization is turned off',
                     message: 'Both rename files and create folders are disabled.',
                     detail: "You must enable at least one of these options in the Organize tab to proceed."
@@ -587,7 +684,7 @@ $(function () {
                 detail: 'This action will modify your local library files based on your current settings.',
             };
 
-            dialog.showMessageBox(null, options).then( (r) => {
+            showMessageBox(options).then( (r) => {
                 if (r.response === 0) {
                     $('.tabgroup > div').hide();
                     $(".progress-container").show();
@@ -600,10 +697,7 @@ $(function () {
                         state.dlc = undefined;
                         loadTab("#library");
                         scanLocalFolder(true);
-                        dialog.showMessageBox(null, {
-                            type: 'info',
-                            buttons: ['Ok'],
-                            defaultId: 0,
+                        showMessageBox({
                             title: 'Success',
                             message: 'Operation completed successfully'
                         });
@@ -620,13 +714,13 @@ $(function () {
             if(state.settings.dark_mode) {
                 document.body.classList.add("bootstrap-dark");
                 document.body.classList.remove("bootstrap");
-                try { require('electron').remote.nativeTheme.themeSource = 'dark'; } catch(e){}
+                // nativeTheme handled via CSS class toggle above
                 $('meta[name="color-scheme"]').attr("content", "dark");
                 $("#toggle-dark-mode").text("☀️");
             } else {
                 document.body.classList.add("bootstrap");
                 document.body.classList.remove("bootstrap-dark");
-                try { require('electron').remote.nativeTheme.themeSource = 'light'; } catch(e){}
+                // nativeTheme handled via CSS class toggle above
                 $('meta[name="color-scheme"]').attr("content", "light");
                 $("#toggle-dark-mode").text("🌙");
             }
@@ -655,7 +749,7 @@ $(function () {
                 message: 'Are you sure you want to perform a Hard Rescan?',
                 detail: 'This will completely clear the local database cache and do a deep scan of all your files again. It will take longer than a normal rescan.',
             };
-            dialog.showMessageBox(null, options).then( (r) => {
+            showMessageBox(options).then( (r) => {
                 if (r.response === 0) {
                     sendMessage("hardRescan", "", function(){});
                 }
@@ -690,17 +784,10 @@ $(function () {
         window.addEventListener('resize', () => {
             clearTimeout(resizeTimer);
             resizeTimer = setTimeout(() => {
-                try {
-                    const win = require('electron').remote.getCurrentWindow();
-                    const bounds = win.getBounds();
-                    const isMax = win.isMaximized();
-                    state.settings.window_maximized = isMax;
-                    if (!isMax) {
-                        state.settings.window_width = bounds.width;
-                        state.settings.window_height = bounds.height;
-                    }
-                    sendMessage("saveSettings", JSON.stringify(state.settings), function(){});
-                } catch(e) {}
+                // Use standard window properties instead of electron.remote.getCurrentWindow()
+                state.settings.window_width = window.innerWidth;
+                state.settings.window_height = window.innerHeight;
+                sendMessage("saveSettings", JSON.stringify(state.settings), function(){});
             }, 1000); // Save bounds 1 second after user finishes resizing
         });
 

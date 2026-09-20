@@ -53,17 +53,22 @@ var tweakPool = sync.Pool{
 // block cipher (which must have a block size of 16 bytes). The key must be
 // twice the length of the underlying cipher's key.
 func NewCipher(cipherFunc func([]byte) (cipher.Block, error), key []byte) (c *Cipher, err error) {
+	if len(key) != 32 && len(key) != 64 {
+		return nil, errors.New("xts: key must be 32 or 64 bytes")
+	}
 	c = new(Cipher)
 	if c.k1, err = cipherFunc(key[:len(key)/2]); err != nil {
-		return
+		return nil, err
 	}
-	c.k2, err = cipherFunc(key[len(key)/2:])
-
-	if c.k1.BlockSize() != blockSize {
-		err = errors.New("xts: cipher does not have a block size of 16")
+	if c.k2, err = cipherFunc(key[len(key)/2:]); err != nil {
+		return nil, err
 	}
 
-	return
+	if c.k1.BlockSize() != blockSize || c.k2.BlockSize() != blockSize {
+		return nil, errors.New("xts: cipher does not have a block size of 16")
+	}
+
+	return c, nil
 }
 
 // Encrypt encrypts a sector of plaintext and puts the result into ciphertext.
@@ -118,27 +123,25 @@ func (c *Cipher) Decrypt(plaintext, ciphertext []byte, tweak *[16]byte) {
 	if InexactOverlap(plaintext[:len(ciphertext)], ciphertext) {
 		panic("xts: invalid buffer overlap")
 	}
-
-	/*
-		tweak := tweakPool.Get().(*[blockSize]byte)
-		for i := range tweak {
-			tweak[i] = 0
-		}
-		binary.LittleEndian.PutUint64(tweak[:8], sectorNum)
-	*/
-	c.k2.Encrypt(tweak[:], tweak[:])
+	// Copy the tweak locally: Encrypt mutates it via mul2, so reusing the
+	// caller's buffer would corrupt subsequent sectors.
+	var localTweak [16]byte
+	if tweak != nil {
+		localTweak = *tweak
+	}
+	c.k2.Encrypt(localTweak[:], localTweak[:])
 	for len(ciphertext) > 0 {
-		for j := range tweak {
-			plaintext[j] = ciphertext[j] ^ tweak[j]
+		for j := range localTweak {
+			plaintext[j] = ciphertext[j] ^ localTweak[j]
 		}
 		c.k1.Decrypt(plaintext, plaintext)
-		for j := range tweak {
-			plaintext[j] ^= tweak[j]
+		for j := range localTweak {
+			plaintext[j] ^= localTweak[j]
 		}
 		plaintext = plaintext[blockSize:]
 		ciphertext = ciphertext[blockSize:]
 
-		mul2(tweak)
+		mul2(&localTweak)
 	}
 
 	//tweakPool.Put(tweak)

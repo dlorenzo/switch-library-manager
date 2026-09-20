@@ -8,6 +8,7 @@ on:
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write # Required to create a release
     steps:
@@ -38,6 +39,6 @@ jobs:
           (cd src/output/darwin-amd64 && zip -r ../../../release_packages/switch-library-manager.darwin-amd64.zip *)
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           files: release_packages/*

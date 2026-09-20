@@ -1,16 +1,19 @@
 package process
 
 import (
-	"io/ioutil"
+	"errors"
+	"io"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/trembon/switch-library-manager/db"
-	"github.com/trembon/switch-library-manager/settings"
+	"github.com/firebat20/switch-library-manager/db"
+	"github.com/firebat20/switch-library-manager/settings"
 	"go.uber.org/zap"
 	"robpike.io/nihongo"
 )
@@ -21,6 +24,11 @@ var (
 	cjk                     = regexp.MustCompile("[\u2f70-\u2FA1\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff66-\uff9f\\p{Katakana}\\p{Hiragana}\\p{Hangul}]")
 )
 
+// DeleteOldUpdates removes duplicate/obsolete update files identified during
+// the scan. baseFolder must be the *library* folder being organized (the same
+// folder passed to OrganizeByFolders): the subsequent empty-folder pruning
+// walks it, and pointing it at the application's install directory would prune
+// directories next to the executable instead.
 func DeleteOldUpdates(baseFolder string, localDB *db.LocalSwitchFilesDB, updateProgress db.ProgressUpdater) {
 	i := 0
 	for k, v := range localDB.Skipped {
@@ -55,14 +63,14 @@ func DeleteOldUpdates(baseFolder string, localDB *db.LocalSwitchFilesDB, updateP
 
 	if i != 0 && settings.ReadSettings(baseFolder).OrganizeOptions.DeleteEmptyFolders {
 		if updateProgress != nil {
-			updateProgress.UpdateProgress(i, i+1, "Deleting empty folders... (can take 1-2min)")
+			updateProgress.UpdateProgress(i, i+1, "Deleting empty folders...")
 		}
 		err := deleteEmptyFolders(baseFolder)
 		if err != nil {
 			zap.S().Errorf("Failed to delete empty folders [%v]\n", err)
 		}
 		if updateProgress != nil {
-			updateProgress.UpdateProgress(i+1, i+1, "Deleting empty folders... (can take 1-2min)")
+			updateProgress.UpdateProgress(i+1, i+1, "Deleting empty folders...")
 		}
 	}
 }
@@ -91,7 +99,11 @@ func OrganizeByFolders(baseFolder string,
 			updateProgress.UpdateProgress(i, tasksSize, k)
 		}
 
-		title, titleExist := titlesDB.TitlesMap[k]
+		var title *db.SwitchTitle
+		var titleExist bool
+		if titlesDB != nil && titlesDB.TitlesMap != nil {
+			title, titleExist = titlesDB.TitlesMap[k]
+		}
 		titleName := getTitleName(title, v)
 
 		templateData := map[string]string{}
@@ -130,6 +142,9 @@ func OrganizeByFolders(baseFolder string,
 		}
 
 		var destinationPath = v.File.ExtendedInfo.BaseFolder
+		if destinationPath == "" {
+			destinationPath = baseFolder
+		}
 
 		//create folder if needed
 		if options.CreateFolderPerGame {
@@ -143,15 +158,26 @@ func OrganizeByFolders(baseFolder string,
 		if v.IsSplit {
 			//in case of a split file, we only rename the folder and then move all the split
 			//files with the new folder
-			files, err := ioutil.ReadDir(v.File.ExtendedInfo.BaseFolder)
+			files, err := os.ReadDir(v.File.ExtendedInfo.BaseFolder)
 			if err != nil {
 				continue
 			}
 
+			baseName := v.File.ExtendedInfo.FileName
+			idx := len(baseName) - 1
+			for idx >= 0 && baseName[idx] >= '0' && baseName[idx] <= '9' {
+				idx--
+			}
+			prefix := baseName[:idx+1]
+
 			for _, file := range files {
-				if _, err := strconv.Atoi(file.Name()[len(file.Name())-1:]); err == nil {
-					from := filepath.Join(v.File.ExtendedInfo.BaseFolder, file.Name())
-					to := filepath.Join(destinationPath, file.Name())
+				if file.IsDir() {
+					continue
+				}
+				name := file.Name()
+				if isSplitPart(name, prefix) {
+					from := filepath.Join(v.File.ExtendedInfo.BaseFolder, name)
+					to := filepath.Join(destinationPath, name)
 					err := moveFile(from, to)
 					if err != nil {
 						logger.Errorf("Failed to move file [%v]\n", err)
@@ -194,7 +220,9 @@ func OrganizeByFolders(baseFolder string,
 			}
 			templateData[settings.TEMPLATE_VERSION] = strconv.Itoa(update)
 			templateData[settings.TEMPLATE_TYPE] = "UPD"
-			if updateInfo.Metadata.Ncap != nil {
+			// Metadata itself can be nil here; only the TitleId assignment above
+			// was guarded. Check Metadata before reaching into Ncap.
+			if updateInfo.Metadata != nil && updateInfo.Metadata.Ncap != nil {
 				templateData[settings.TEMPLATE_VERSION_TXT] = updateInfo.Metadata.Ncap.DisplayVersion
 			} else {
 				templateData[settings.TEMPLATE_VERSION_TXT] = ""
@@ -203,15 +231,29 @@ func OrganizeByFolders(baseFolder string,
 			from = filepath.Join(updateInfo.ExtendedInfo.BaseFolder, updateInfo.ExtendedInfo.FileName)
 			if options.CreateFolderPerGame {
 				if options.UpdatesFolder != "" {
-					to = filepath.Join(destinationPath, options.UpdatesFolder)
-					createFolder(to, logger)
-					to = filepath.Join(to, getFileName(options, updateInfo.ExtendedInfo.FileName, templateData, 0))
+					targetDir, err := resolveSubDir(destinationPath, options.UpdatesFolder)
+					if err != nil {
+						logger.Errorf("Invalid updates folder [%v]: %v", options.UpdatesFolder, err)
+						continue
+					}
+					if err := createFolder(targetDir, logger); err != nil {
+						continue
+					}
+					to = filepath.Join(targetDir, getFileName(options, updateInfo.ExtendedInfo.FileName, templateData, 0))
 				} else {
 					to = filepath.Join(destinationPath, getFileName(options, updateInfo.ExtendedInfo.FileName, templateData, 0))
 				}
 			} else {
 				if options.UpdatesFolder != "" {
-					to = filepath.Join(options.UpdatesFolder, getFileName(options, updateInfo.ExtendedInfo.FileName, templateData, 0))
+					targetDir, err := resolveSubDir(baseFolder, options.UpdatesFolder)
+					if err != nil {
+						logger.Errorf("Invalid updates folder [%v]: %v", options.UpdatesFolder, err)
+						continue
+					}
+					if err := createFolder(targetDir, logger); err != nil {
+						continue
+					}
+					to = filepath.Join(targetDir, getFileName(options, updateInfo.ExtendedInfo.FileName, templateData, 0))
 				} else {
 					to = filepath.Join(updateInfo.ExtendedInfo.BaseFolder, getFileName(options, updateInfo.ExtendedInfo.FileName, templateData, 0))
 				}
@@ -241,36 +283,57 @@ func OrganizeByFolders(baseFolder string,
 			from = filepath.Join(dlc.ExtendedInfo.BaseFolder, dlc.ExtendedInfo.FileName)
 
 			dlcNameTry := 0
+			to = ""
 			for {
 				if options.CreateFolderPerGame {
 					if options.DlcFolder != "" {
-						to = filepath.Join(destinationPath, options.DlcFolder)
-						createFolder(to, logger)
-						to = filepath.Join(to, getFileName(options, dlc.ExtendedInfo.FileName, templateData, dlcNameTry))
+						targetDir, err := resolveSubDir(destinationPath, options.DlcFolder)
+						if err != nil {
+							logger.Errorf("Invalid DLC folder [%v]: %v", options.DlcFolder, err)
+							break
+						}
+						if err := createFolder(targetDir, logger); err != nil {
+							break
+						}
+						to = filepath.Join(targetDir, getFileName(options, dlc.ExtendedInfo.FileName, templateData, dlcNameTry))
 					} else {
 						to = filepath.Join(destinationPath, getFileName(options, dlc.ExtendedInfo.FileName, templateData, dlcNameTry))
 					}
 				} else {
 					if options.DlcFolder != "" {
-						to = filepath.Join(options.DlcFolder, getFileName(options, dlc.ExtendedInfo.FileName, templateData, dlcNameTry))
+						targetDir, err := resolveSubDir(baseFolder, options.DlcFolder)
+						if err != nil {
+							logger.Errorf("Invalid DLC folder [%v]: %v", options.DlcFolder, err)
+							break
+						}
+						if err := createFolder(targetDir, logger); err != nil {
+							break
+						}
+						to = filepath.Join(targetDir, getFileName(options, dlc.ExtendedInfo.FileName, templateData, dlcNameTry))
 					} else {
 						to = filepath.Join(dlc.ExtendedInfo.BaseFolder, getFileName(options, dlc.ExtendedInfo.FileName, templateData, dlcNameTry))
 					}
 				}
 
-				// check if dlc will generate a duplicate name as a previous dlc, but not have the same id
-				// this is to prevent deletion of dlc with the same name
-				value, exists := existingDlcs[to]
-				if !exists && value != id {
-					break
-				}
-
-				// if it exists and has same id, break and the remove duplicate file should handle this one
-				if exists && value == id {
+				// Check if this dlc will generate the same destination name as a
+				// previously-placed dlc. If the name is free, or it already maps to
+				// THIS dlc's id, we can use it. Otherwise it's a different dlc that
+				// happens to render to the same name - bump the numeric suffix and
+				// try again so we don't clobber the other file.
+				existingID, exists := existingDlcs[to]
+				if !exists || existingID == id {
 					break
 				}
 
 				dlcNameTry++
+				if dlcNameTry > 100 {
+					logger.Errorf("Too many DLC name collisions for %v", id)
+					to = ""
+					break
+				}
+			}
+			if to == "" {
+				continue
 			}
 			existingDlcs[to] = id
 
@@ -285,7 +348,7 @@ func OrganizeByFolders(baseFolder string,
 	if options.DeleteEmptyFolders {
 		if updateProgress != nil {
 			i += 1
-			updateProgress.UpdateProgress(i, tasksSize, "Deleting empty folders... (can take 1-2min)")
+			updateProgress.UpdateProgress(i, tasksSize, "Deleting empty folders...")
 		}
 		err := deleteEmptyFolders(baseFolder)
 		if err != nil {
@@ -332,12 +395,13 @@ func IsOptionsValid(options settings.OrganizeOptions) bool {
 }
 
 func getDlcName(switchTitle *db.SwitchTitle, file db.SwitchFileInfo) string {
-	if switchTitle == nil {
+	if switchTitle == nil || file.Metadata == nil {
 		return ""
 	}
 	if dlcAttributes, ok := switchTitle.Dlc[file.Metadata.TitleId]; ok {
 		name := dlcAttributes.Name
 		name = strings.ReplaceAll(name, "\n", " ")
+		name = strings.ReplaceAll(name, "\r", " ")
 		return name
 	}
 	return ""
@@ -348,7 +412,7 @@ func getTitleName(switchTitle *db.SwitchTitle, v *db.SwitchGameFiles) string {
 	if switchTitle != nil && switchTitle.Attributes.Name != "" {
 		res := cjk.FindAllString(switchTitle.Attributes.Name, -1)
 		if len(res) == 0 {
-			return switchTitle.Attributes.Name
+			return sanitizeTitleName(switchTitle.Attributes.Name)
 		}
 	}
 
@@ -357,17 +421,56 @@ func getTitleName(switchTitle *db.SwitchTitle, v *db.SwitchGameFiles) string {
 		// Check if the title name exists
 		name := v.File.Metadata.Ncap.TitleName["AmericanEnglish"].Title
 		if name != "" {
-			return name
+			return sanitizeTitleName(name)
 		}
 	}
 
 	// For non-eShop games, get the name from the file
 	if v != nil {
-		return db.ParseTitleNameFromFileName(v.File.ExtendedInfo.FileName)
+		return sanitizeTitleName(db.ParseTitleNameFromFileName(v.File.ExtendedInfo.FileName))
 	}
 
 	// Default return if no valid name is found
 	return "Unknown Title"
+}
+
+func sanitizeTitleName(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7F {
+			return -1
+		}
+		return r
+	}, s)
+	s = strings.TrimSpace(s)
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	if s == "" {
+		return "Unknown Title"
+	}
+	return s
+}
+
+// resolveSubDir joins a user-configured subfolder onto base and ensures the
+// result stays inside base (rejects absolute paths and ../../ escapes).
+func resolveSubDir(base, sub string) (string, error) {
+	if sub == "" {
+		return base, nil
+	}
+	if filepath.IsAbs(sub) {
+		return "", errors.New("absolute subfolder not allowed: " + sub)
+	}
+	joined := filepath.Join(base, sub)
+	rel, err := filepath.Rel(base, joined)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errors.New("subfolder escapes library root: " + sub)
+	}
+	return joined, nil
 }
 
 func getFolderName(options settings.OrganizeOptions, templateData map[string]string) string {
@@ -388,8 +491,67 @@ func moveFile(from string, to string) error {
 	if from == to {
 		return nil
 	}
+
+	// os.Rename silently overwrites an existing destination on most platforms.
+	// Before moving, make sure we are not about to clobber a *different* file.
+	// os.SameFile handles case-insensitive filesystems and hardlinks, so a
+	// rename that only changes casing of the same underlying file still works.
+	if toInfo, err := os.Stat(to); err == nil {
+		if fromInfo, ferr := os.Stat(from); ferr == nil && !os.SameFile(fromInfo, toInfo) {
+			zap.S().Warnf("Refusing to overwrite existing file: %v", to)
+			return errors.New("destination already exists: " + to)
+		}
+	}
+
 	err := os.Rename(from, to)
-	return err
+	if err == nil {
+		return nil
+	}
+
+	// Fallback to copy and delete if rename fails (e.g. cross-device link error across partitions/drives)
+	return copyAndDelete(from, to)
+}
+
+func copyAndDelete(from string, to string) error {
+	srcFile, err := os.Open(from)
+	if err != nil {
+		return err
+	}
+
+	srcInfo, err := srcFile.Stat()
+	if err != nil {
+		srcFile.Close()
+		return err
+	}
+
+	dstFile, err := os.OpenFile(to, os.O_WRONLY|os.O_CREATE|os.O_EXCL, srcInfo.Mode())
+	if err != nil {
+		srcFile.Close()
+		return err
+	}
+
+	_, err = io.Copy(dstFile, srcFile)
+	syncErr := dstFile.Sync()
+	closeErr := dstFile.Close()
+	// Windows locks open files: release the source handle before removing it.
+	srcCloseErr := srcFile.Close()
+	if err != nil {
+		_ = os.Remove(to)
+		return err
+	}
+	if syncErr != nil {
+		_ = os.Remove(to)
+		return syncErr
+	}
+	if closeErr != nil {
+		_ = os.Remove(to)
+		return closeErr
+	}
+	if srcCloseErr != nil {
+		return srcCloseErr
+	}
+
+	return os.Remove(from)
 }
 
 func applyTemplate(templateData map[string]string, useSafeNames bool, template string, nameTry int) string {
@@ -431,12 +593,24 @@ func applyTemplate(templateData map[string]string, useSafeNames bool, template s
 	result = space.ReplaceAllString(result, " ")
 
 	result = strings.TrimSpace(result)
-	return folderIllegalCharsRegex.ReplaceAllString(result, "")
+	result = folderIllegalCharsRegex.ReplaceAllString(result, "")
+
+	// The illegal-chars regex above does not strip '.', so a crafted title name
+	// (from titles.json or NACP metadata) could still be "." or ".." and escape
+	// the library root once joined. Neutralize any pure dot-segments.
+	if result == "." || result == ".." {
+		return ""
+	}
+
+	return result
 }
 
 func createFolder(path string, logger *zap.SugaredLogger) error {
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		err = os.Mkdir(path, os.ModePerm)
+		// 0755 rather than os.ModePerm (0777): the created library folders
+		// should not be world-writable. MkdirAll also creates any missing
+		// parent directories, unlike Mkdir.
+		err = os.MkdirAll(path, 0755)
 		if err != nil {
 			logger.Errorf("Failed to create folder %v - %v\n", path, err)
 			return err
@@ -445,35 +619,71 @@ func createFolder(path string, logger *zap.SugaredLogger) error {
 	return nil
 }
 
+// deleteEmptyFolders removes empty directories under path (never path itself),
+// cascading upwards: a directory whose only contents were empty directories is
+// removed as well.
+//
+// The previous implementation walked the whole tree to collect directories and
+// then issued a separate os.ReadDir per directory to test emptiness - two full
+// listings of every directory. This version counts each directory's children
+// during a single WalkDir pass and maintains those counts as it deletes, so no
+// re-listing is needed at all.
 func deleteEmptyFolders(path string) error {
-	err := filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			zap.S().Error("Error while deleting empty folders", err)
-		}
-		if info != nil && info.IsDir() {
-			err = deleteEmptyFolder(path)
-			if err != nil {
-				zap.S().Error("Error while deleting empty folders", err)
-			}
-		}
+	path = filepath.Clean(path)
+	childCount := map[string]int{}
+	var dirs []string
 
+	err := filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			zap.S().Error("Error while scanning for empty folders", err)
+			return nil
+		}
+		if p == path {
+			return nil
+		}
+		childCount[filepath.Dir(p)]++
+		if d.IsDir() {
+			dirs = append(dirs, p)
+		}
 		return nil
 	})
-	return err
-}
-
-func deleteEmptyFolder(path string) error {
-	files, err := ioutil.ReadDir(path)
 	if err != nil {
 		return err
 	}
 
-	if len(files) != 0 {
-		return nil
+	// Sort directories by path length in descending order to process deepest first (bottom-up)
+	sort.Slice(dirs, func(i, j int) bool {
+		return len(dirs[i]) > len(dirs[j])
+	})
+
+	for _, dir := range dirs {
+		if childCount[dir] != 0 {
+			continue
+		}
+		zap.S().Infof("\nDeleting empty folder [%v]", dir)
+		if rmErr := os.Remove(dir); rmErr != nil {
+			zap.S().Error("Error while deleting empty folder", rmErr)
+			continue
+		}
+		// The parent just lost one child; it may now be empty and will be
+		// visited later in this loop (parents sort after their children).
+		childCount[filepath.Dir(dir)]--
 	}
-
-	zap.S().Infof("\nDeleting empty folder [%v]", path)
-	_ = os.Remove(path)
-
 	return nil
+}
+
+func isSplitPart(fileName string, prefix string) bool {
+	if !strings.HasPrefix(fileName, prefix) {
+		return false
+	}
+	suffix := fileName[len(prefix):]
+	if len(suffix) == 0 {
+		return false
+	}
+	for i := 0; i < len(suffix); i++ {
+		if suffix[i] < '0' || suffix[i] > '9' {
+			return false
+		}
+	}
+	return true
 }

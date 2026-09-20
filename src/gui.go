@@ -2,21 +2,23 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/asticode/go-astikit"
-	"github.com/asticode/go-astilectron"
-	bootstrap "github.com/asticode/go-astilectron-bootstrap"
-	"github.com/trembon/switch-library-manager/db"
-	"github.com/trembon/switch-library-manager/process"
-	"github.com/trembon/switch-library-manager/settings"
+	"github.com/firebat20/go-astilectron"
+	bootstrap "github.com/firebat20/go-astilectron-bootstrap"
+	"github.com/firebat20/switch-library-manager/db"
+	"github.com/firebat20/switch-library-manager/process"
+	"github.com/firebat20/switch-library-manager/settings"
 	"go.uber.org/zap"
 )
 
@@ -122,7 +124,10 @@ func (g *GUI) Start() {
 				Center:          astikit.BoolPtr(true),
 				Height:          astikit.IntPtr(settingsObj.WindowHeight),
 				Width:           astikit.IntPtr(settingsObj.WindowWidth),
-				WebPreferences:  &astilectron.WebPreferences{EnableRemoteModule: astikit.BoolPtr(true)},
+				// SECURITY NOTE: EnableRemoteModule is set to false. All renderer
+				// interactions (dialogs, file explorer actions, window state)
+				// are handled via Astilectron IPC messages to Go.
+				WebPreferences: &astilectron.WebPreferences{EnableRemoteModule: astikit.BoolPtr(false)},
 			},
 		}},
 	}); err != nil {
@@ -131,10 +136,19 @@ func (g *GUI) Start() {
 	}
 }
 
+func (g *GUI) sendToUI(name, payload string) {
+	g.state.Lock()
+	w := g.state.window
+	g.state.Unlock()
+	if w == nil {
+		g.sugarLogger.Warnf("cannot send %s: window not ready", name)
+		return
+	}
+	w.SendMessage(Message{Name: name, Payload: payload}, func(m *astilectron.EventMessage) {})
+}
+
 func (g *GUI) handleMessage(m *astilectron.EventMessage) interface{} {
 	var retValue string
-	g.state.Lock()
-	defer g.state.Unlock()
 	msg := Message{}
 	err := m.Unmarshal(&msg)
 
@@ -154,18 +168,28 @@ func (g *GUI) handleMessage(m *astilectron.EventMessage) interface{} {
 	case "loadSettings":
 		retValue = g.loadSettings()
 
-		g.state.window.SetAlwaysOnTop(false)
+		g.state.Lock()
+		w := g.state.window
+		g.state.Unlock()
+		if w != nil {
+			w.SetAlwaysOnTop(false)
+		}
 	case "saveSettings":
 		err = g.saveSettings(msg.Payload)
 		if err != nil {
 			g.sugarLogger.Error(err)
-			g.state.window.SendMessage(Message{Name: "error", Payload: err.Error()}, func(m *astilectron.EventMessage) {})
+			g.sendToUI("error", err.Error())
 			return ""
 		}
 	case "missingGames":
 		missingGames := g.getMissingGames()
-		msg, _ := json.Marshal(missingGames)
-		g.state.window.SendMessage(Message{Name: "missingGames", Payload: string(msg)}, func(m *astilectron.EventMessage) {})
+		msgBytes, err := json.Marshal(missingGames)
+		if err != nil {
+			g.sugarLogger.Error(err)
+			g.sendToUI("error", err.Error())
+			return ""
+		}
+		g.sendToUI("missingGames", string(msgBytes))
 	case "checkMaximized":
 		settingsObj := settings.ReadSettings(g.baseFolder)
 		retValue = strconv.FormatBool(settingsObj.WindowMaximized)
@@ -174,7 +198,7 @@ func (g *GUI) handleMessage(m *astilectron.EventMessage) interface{} {
 		localDB, err := g.buildLocalDB(g.localDbManager, ignoreCache)
 		if err != nil {
 			g.sugarLogger.Error(err)
-			g.state.window.SendMessage(Message{Name: "error", Payload: err.Error()}, func(m *astilectron.EventMessage) {})
+			g.sendToUI("error", err.Error())
 			return ""
 		}
 		response := LocalLibraryData{}
@@ -184,19 +208,31 @@ func (g *GUI) handleMessage(m *astilectron.EventMessage) interface{} {
 			if v.BaseExist {
 				version := ""
 				name := ""
-				if v.File.Metadata.Ncap != nil {
+				if v.File.Metadata != nil && v.File.Metadata.Ncap != nil {
 					version = v.File.Metadata.Ncap.DisplayVersion
 					name = v.File.Metadata.Ncap.TitleName["AmericanEnglish"].Title
 				}
 
 				if v.Updates != nil && len(v.Updates) != 0 {
-					if v.Updates[v.LatestUpdate].Metadata.Ncap != nil {
-						version = v.Updates[v.LatestUpdate].Metadata.Ncap.DisplayVersion
+					// v.LatestUpdate may not be a key in the map; indexing a
+					// missing key yields a zero-value SwitchFileInfo whose
+					// Metadata is nil, so dereferencing .Metadata.Ncap panics.
+					// Look the entry up explicitly and nil-check every hop.
+					if latest, ok := v.Updates[v.LatestUpdate]; ok &&
+						latest.Metadata != nil && latest.Metadata.Ncap != nil {
+						version = latest.Metadata.Ncap.DisplayVersion
 					} else {
 						version = ""
 					}
 				}
-				if title, ok := g.state.switchDB.TitlesMap[k]; ok {
+				var title *db.SwitchTitle
+				var titleOk bool
+				g.state.Lock()
+				if g.state.switchDB != nil && g.state.switchDB.TitlesMap != nil {
+					title, titleOk = g.state.switchDB.TitlesMap[k]
+				}
+				g.state.Unlock()
+				if titleOk && title != nil {
 					if title.Attributes.Name != "" {
 						name = title.Attributes.Name
 					}
@@ -215,14 +251,18 @@ func (g *GUI) handleMessage(m *astilectron.EventMessage) interface{} {
 					if name == "" {
 						name = db.ParseTitleNameFromFileName(v.File.ExtendedInfo.FileName)
 					}
+					titleId := ""
+					if v.File.Metadata != nil {
+						titleId = v.File.Metadata.TitleId
+					}
 					libraryData = append(libraryData,
 						LibraryTemplateData{
 							Name:    name,
 							Update:  v.LatestUpdate,
 							Version: version,
 							Type:    getType(v),
-							TitleId: v.File.Metadata.TitleId,
-							Path:    v.File.ExtendedInfo.FileName,
+							TitleId: titleId,
+							Path:    filepath.Join(v.File.ExtendedInfo.BaseFolder, v.File.ExtendedInfo.FileName),
 						})
 				}
 
@@ -242,23 +282,42 @@ func (g *GUI) handleMessage(m *astilectron.EventMessage) interface{} {
 		response.LibraryData = libraryData
 		response.NumFiles = localDB.NumFiles
 		response.Issues = issues
-		msg, _ := json.Marshal(response)
-		g.state.window.SendMessage(Message{Name: "libraryLoaded", Payload: string(msg)}, func(m *astilectron.EventMessage) {})
+		msgBytes, err := json.Marshal(response)
+		if err != nil {
+			g.sugarLogger.Error(err)
+			g.sendToUI("error", err.Error())
+			return ""
+		}
+		g.sendToUI("libraryLoaded", string(msgBytes))
 	case "updateDB":
-		if g.state.switchDB == nil {
+		g.state.Lock()
+		needsBuild := g.state.switchDB == nil
+		g.state.Unlock()
+		if needsBuild {
 			switchDb, err := g.buildSwitchDb()
 			if err != nil {
 				g.sugarLogger.Error(err)
-				g.state.window.SendMessage(Message{Name: "error", Payload: err.Error()}, func(m *astilectron.EventMessage) {})
+				g.sendToUI("error", err.Error())
 				return ""
 			}
+			g.state.Lock()
 			g.state.switchDB = switchDb
+			g.state.Unlock()
 		}
 	case "hardRescan":
 		_ = g.localDbManager.ClearScanData()
-		g.state.window.SendMessage(Message{Name: "rescan", Payload: ""}, func(m *astilectron.EventMessage) {})
+		g.sendToUI("rescan", "")
 	case "missingUpdates":
 		retValue = g.getMissingUpdates()
+	case "showItemInFolder":
+		openItemInFolder(msg.Payload)
+	case "maximizeWindow":
+		g.state.Lock()
+		w := g.state.window
+		g.state.Unlock()
+		if w != nil {
+			_ = w.Maximize()
+		}
 	case "missingDlc":
 		retValue = g.getMissingDLC()
 	case "checkUpdate":
@@ -266,7 +325,7 @@ func (g *GUI) handleMessage(m *astilectron.EventMessage) interface{} {
 		if err != nil {
 			g.sugarLogger.Error(err)
 			if !strings.Contains(err.Error(), "dial tcp") {
-				g.state.window.SendMessage(Message{Name: "error", Payload: err.Error()}, func(m *astilectron.EventMessage) {})
+				g.sendToUI("error", err.Error())
 			}
 		}
 		retValue = strconv.FormatBool(newUpdate)
@@ -275,6 +334,26 @@ func (g *GUI) handleMessage(m *astilectron.EventMessage) interface{} {
 	g.sugarLogger.Debugf("Server response [%v]", retValue)
 
 	return retValue
+}
+
+func openItemInFolder(targetPath string) {
+	if targetPath == "" {
+		return
+	}
+	clean := filepath.Clean(targetPath)
+	if !filepath.IsAbs(clean) {
+		return
+	}
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("explorer", "/select,", clean)
+	case "darwin":
+		cmd = exec.Command("open", "-R", clean)
+	default:
+		cmd = exec.Command("xdg-open", filepath.Dir(clean))
+	}
+	_ = cmd.Run()
 }
 
 func getType(gameFile *db.SwitchGameFiles) string {
@@ -293,47 +372,81 @@ func getType(gameFile *db.SwitchGameFiles) string {
 
 func (g *GUI) saveSettings(settingsJson string) error {
 	s := settings.AppSettings{}
-	err := json.Unmarshal([]byte(settingsJson), &s)
-	if err != nil {
+	if err := json.Unmarshal([]byte(settingsJson), &s); err != nil {
 		return err
+	}
+	if s.GuiPagingSize <= 0 {
+		s.GuiPagingSize = 100
+	}
+	if s.TitlesJsonUrl == "" {
+		s.TitlesJsonUrl = settings.DEFAULT_TITLES_JSON_URL
+	}
+	if s.VersionsJsonUrl == "" {
+		s.VersionsJsonUrl = settings.DEFAULT_VERSIONS_JSON_URL
+	}
+	if s.WindowWidth <= 0 {
+		s.WindowWidth = 1200
+	}
+	if s.WindowHeight <= 0 {
+		s.WindowHeight = 600
 	}
 	settings.SaveSettings(&s, g.baseFolder)
 	return nil
 }
 
 func (g *GUI) getMissingDLC() string {
+	g.state.Lock()
+	localDB := g.state.localDB
+	switchDB := g.state.switchDB
+	g.state.Unlock()
+	if localDB == nil || localDB.TitlesMap == nil || switchDB == nil || switchDB.TitlesMap == nil {
+		return "[]"
+	}
 	settingsObj := settings.ReadSettings(g.baseFolder)
 	ignoreIds := map[string]struct{}{}
 	for _, id := range settingsObj.IgnoreDLCTitleIds {
 		ignoreIds[strings.ToLower(id)] = struct{}{}
 	}
-	missingDLC := process.ScanForMissingDLC(g.state.localDB.TitlesMap, g.state.switchDB.TitlesMap, ignoreIds)
-	values := make([]process.IncompleteTitle, len(missingDLC))
-	i := 0
+	missingDLC := process.ScanForMissingDLC(localDB.TitlesMap, switchDB.TitlesMap, ignoreIds)
+	values := make([]process.IncompleteTitle, 0, len(missingDLC))
 	for _, missingUpdate := range missingDLC {
-		values[i] = missingUpdate
-		i++
+		values = append(values, missingUpdate)
 	}
+	sort.Slice(values, func(i, j int) bool { return values[i].Attributes.Id < values[j].Attributes.Id })
 
-	msg, _ := json.Marshal(values)
+	msg, err := json.Marshal(values)
+	if err != nil {
+		g.sugarLogger.Error(err)
+		return "[]"
+	}
 	return string(msg)
 }
 
 func (g *GUI) getMissingUpdates() string {
+	g.state.Lock()
+	localDB := g.state.localDB
+	switchDB := g.state.switchDB
+	g.state.Unlock()
+	if localDB == nil || localDB.TitlesMap == nil || switchDB == nil || switchDB.TitlesMap == nil {
+		return "[]"
+	}
 	settingsObj := settings.ReadSettings(g.baseFolder)
 	ignoreIds := map[string]struct{}{}
 	for _, id := range settingsObj.IgnoreUpdateTitleIds {
 		ignoreIds[strings.ToLower(id)] = struct{}{}
 	}
-	missingUpdates := process.ScanForMissingUpdates(g.state.localDB.TitlesMap, g.state.switchDB.TitlesMap, ignoreIds, settingsObj.IgnoreDLCUpdates)
-	values := make([]process.IncompleteTitle, len(missingUpdates))
-	i := 0
+	missingUpdates := process.ScanForMissingUpdates(localDB.TitlesMap, switchDB.TitlesMap, ignoreIds, settingsObj.IgnoreDLCUpdates)
+	values := make([]process.IncompleteTitle, 0, len(missingUpdates))
 	for _, missingUpdate := range missingUpdates {
-		values[i] = missingUpdate
-		i++
+		values = append(values, missingUpdate)
 	}
+	sort.Slice(values, func(i, j int) bool { return values[i].Attributes.Id < values[j].Attributes.Id })
 
-	msg, _ := json.Marshal(values)
+	msg, err := json.Marshal(values)
+	if err != nil {
+		g.sugarLogger.Error(err)
+		return "[]"
+	}
 	return string(msg)
 }
 
@@ -348,7 +461,10 @@ func (g *GUI) buildSwitchDb() (*db.SwitchTitlesDB, error) {
 	filename := filepath.Join(g.baseFolder, settings.TITLE_JSON_FILENAME)
 	titleFile, titlesEtag, err := db.LoadAndUpdateFile(settingsObj.TitlesJsonUrl, filename, settingsObj.TitlesEtag)
 	if err != nil {
-		return nil, errors.New("failed to download switch titles [reason:" + err.Error() + "]")
+		if titleFile != nil {
+			titleFile.Close()
+		}
+		return nil, fmt.Errorf("failed to download switch titles [reason:%w]", err)
 	}
 	settingsObj.TitlesEtag = titlesEtag
 
@@ -356,7 +472,13 @@ func (g *GUI) buildSwitchDb() (*db.SwitchTitlesDB, error) {
 	filename = filepath.Join(g.baseFolder, settings.VERSIONS_JSON_FILENAME)
 	versionsFile, versionsEtag, err := db.LoadAndUpdateFile(settingsObj.VersionsJsonUrl, filename, settingsObj.VersionsEtag)
 	if err != nil {
-		return nil, errors.New("failed to download switch updates [reason:" + err.Error() + "]")
+		if titleFile != nil {
+			titleFile.Close()
+		}
+		if versionsFile != nil {
+			versionsFile.Close()
+		}
+		return nil, fmt.Errorf("failed to download switch updates [reason:%w]", err)
 	}
 	settingsObj.VersionsEtag = versionsEtag
 
@@ -364,36 +486,65 @@ func (g *GUI) buildSwitchDb() (*db.SwitchTitlesDB, error) {
 
 	g.UpdateProgress(3, 4, "Processing switch titles and updates")
 	switchTitleDB, err := db.CreateSwitchTitleDB(titleFile, versionsFile)
-	g.UpdateProgress(4, 4, "Finishing up...")
+	if err != nil {
+		g.UpdateProgress(4, 4, "Failed")
+	} else {
+		g.UpdateProgress(4, 4, "Finishing up...")
+	}
 	return switchTitleDB, err
 }
 
 func (g *GUI) buildLocalDB(localDbManager *db.LocalSwitchDBManager, ignoreCache bool) (*db.LocalSwitchFilesDB, error) {
-	folderToScan := settings.ReadSettings(g.baseFolder).Folder
-	recursiveMode := settings.ReadSettings(g.baseFolder).ScanRecursively
+	cfg := settings.ReadSettings(g.baseFolder)
+	folderToScan := cfg.Folder
+	recursiveMode := cfg.ScanRecursively
 
-	scanFolders := settings.ReadSettings(g.baseFolder).ScanFolders
-	scanFolders = append(scanFolders, folderToScan)
+	scanFolders := append([]string{}, cfg.ScanFolders...)
+	if folderToScan != "" {
+		scanFolders = append(scanFolders, folderToScan)
+	}
 	localDB, err := localDbManager.CreateLocalSwitchFilesDB(scanFolders, g, recursiveMode, ignoreCache)
+	g.state.Lock()
 	g.state.localDB = localDB
+	g.state.Unlock()
 	return localDB, err
 }
 
 func (g *GUI) organizeLibrary() {
+	g.state.Lock()
+	localDB := g.state.localDB
+	switchDB := g.state.switchDB
+	g.state.Unlock()
+	if localDB == nil {
+		zap.S().Error("local library is not loaded, cannot organize")
+		g.sendToUI("error", "Local library is not loaded. Please scan your library first.")
+		return
+	}
 	folderToScan := settings.ReadSettings(g.baseFolder).Folder
 	options := settings.ReadSettings(g.baseFolder).OrganizeOptions
 	if !process.IsOptionsValid(options) {
 		zap.S().Error("the organize options in settings.json are not valid, please check that the template contains file/folder name")
-		g.state.window.SendMessage(Message{Name: "error", Payload: "the organize options in settings.json are not valid, please check that the template contains file/folder name"}, func(m *astilectron.EventMessage) {})
+		g.sendToUI("error", "the organize options in settings.json are not valid, please check that the template contains file/folder name")
 		return
 	}
 	if settings.ReadSettings(g.baseFolder).OrganizeOptions.DeleteOldUpdateFiles {
-		process.DeleteOldUpdates(g.baseFolder, g.state.localDB, g)
+		// Clean within the library folder being organized, not the app's
+		// install directory (g.baseFolder).
+		process.DeleteOldUpdates(folderToScan, localDB, g)
 	}
-	process.OrganizeByFolders(folderToScan, g.state.localDB, g.state.switchDB, g)
+	process.OrganizeByFolders(folderToScan, localDB, switchDB, g)
 }
 
 func (g *GUI) UpdateProgress(curr int, total int, message string) {
+	if curr < 0 {
+		curr = 0
+	}
+	if total <= 0 {
+		total = 1
+	}
+	if curr > total {
+		curr = total
+	}
 	progressMessage := ProgressUpdate{curr, total, message}
 	g.sugarLogger.Debugf("%v (%v/%v)", message, curr, total)
 	msg, err := json.Marshal(progressMessage)
@@ -402,20 +553,33 @@ func (g *GUI) UpdateProgress(curr int, total int, message string) {
 		return
 	}
 
-	g.state.window.SendMessage(Message{Name: "updateProgress", Payload: string(msg)}, func(m *astilectron.EventMessage) {})
+	g.state.Lock()
+	w := g.state.window
+	g.state.Unlock()
+	if w == nil {
+		return
+	}
+	w.SendMessage(Message{Name: "updateProgress", Payload: string(msg)}, func(m *astilectron.EventMessage) {})
 }
 
 func (g *GUI) getMissingGames() []SwitchTitle {
-	var result []SwitchTitle
-	for k, v := range g.state.switchDB.TitlesMap {
-		if _, ok := g.state.localDB.TitlesMap[k]; ok {
+	result := []SwitchTitle{}
+	g.state.Lock()
+	switchDB := g.state.switchDB
+	localDB := g.state.localDB
+	g.state.Unlock()
+	if switchDB == nil || switchDB.TitlesMap == nil || localDB == nil || localDB.TitlesMap == nil {
+		return result
+	}
+	options := settings.ReadSettings(g.baseFolder)
+	for k, v := range switchDB.TitlesMap {
+		if _, ok := localDB.TitlesMap[k]; ok {
 			continue
 		}
 		if v.Attributes.Name == "" || v.Attributes.Id == "" {
 			continue
 		}
 
-		options := settings.ReadSettings(g.baseFolder)
 		if options.HideDemoGames && v.Attributes.IsDemo {
 			continue
 		}

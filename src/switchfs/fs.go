@@ -26,17 +26,39 @@ type hashInfo struct {
 	pfs0size         uint64
 }
 
-func getFsEntry(ncaHeader *ncaHeader, index int) fsEntry {
+func getFsEntry(ncaHeader *ncaHeader, index int) (fsEntry, error) {
+	if ncaHeader == nil || len(ncaHeader.headerBytes) < 0xC00 {
+		return fsEntry{}, errors.New("invalid NCA header")
+	}
+	if index < 0 || index >= 4 {
+		return fsEntry{}, errors.New("invalid FS section index")
+	}
 	fsEntryOffset := 0x240 + 0x10*index
 	fsEntryBytes := ncaHeader.headerBytes[fsEntryOffset : fsEntryOffset+0x10]
 
-	entryStartOffset := binary.LittleEndian.Uint32(fsEntryBytes[0x0:0x4]) * 0x200
-	entryEndOffset := binary.LittleEndian.Uint32(fsEntryBytes[0x4:0x8]) * 0x200
+	entryStartOffset := uint64(binary.LittleEndian.Uint32(fsEntryBytes[0x0:0x4])) * 0x200
+	entryEndOffset := uint64(binary.LittleEndian.Uint32(fsEntryBytes[0x4:0x8])) * 0x200
+	if entryEndOffset < entryStartOffset {
+		return fsEntry{}, errors.New("invalid FS entry: end before start")
+	}
+	size := entryEndOffset - entryStartOffset
+	if size > maxNcaSectionSize {
+		return fsEntry{}, errors.New("invalid FS entry: size exceeds sanity limit")
+	}
+	if entryStartOffset > 0xFFFFFFFF || entryEndOffset > 0xFFFFFFFF {
+		return fsEntry{}, errors.New("invalid FS entry: offset out of range")
+	}
 
-	return fsEntry{StartOffset: entryStartOffset, EndOffset: entryEndOffset, Size: entryEndOffset - entryStartOffset}
+	return fsEntry{StartOffset: uint32(entryStartOffset), EndOffset: uint32(entryEndOffset), Size: uint32(size)}, nil
 }
 
 func getFsHeader(ncaHeader *ncaHeader, index int) (*fsHeader, error) {
+	if ncaHeader == nil || len(ncaHeader.headerBytes) < 0xC00 {
+		return nil, errors.New("invalid NCA header")
+	}
+	if index < 0 || index >= 4 {
+		return nil, errors.New("invalid FS section index")
+	}
 	fsHeaderHashOffset := /*hash pfs0HeaderOffset*/ 0x280 + /*hash pfs0size*/ 0x20*index
 	fsHeaderHash := ncaHeader.headerBytes[fsHeaderHashOffset : fsHeaderHashOffset+0x20]
 
@@ -45,7 +67,7 @@ func getFsHeader(ncaHeader *ncaHeader, index int) (*fsHeader, error) {
 
 	actualHash := sha256.Sum256(fsHeaderBytes)
 
-	if bytes.Compare(actualHash[:], fsHeaderHash) != 0 {
+	if !bytes.Equal(actualHash[:], fsHeaderHash) {
 		return nil, errors.New("fs headerBytes hash mismatch")
 	}
 
@@ -62,6 +84,9 @@ func getFsHeader(ncaHeader *ncaHeader, index int) (*fsHeader, error) {
 }
 
 func (fh *fsHeader) getHashInfo() (*hashInfo, error) {
+	if fh == nil || len(fh.fsHeaderBytes) < 0x200 {
+		return nil, errors.New("invalid FS header")
+	}
 	hashInfoBytes := fh.fsHeaderBytes[0x8:0x100]
 	result := hashInfo{}
 	if fh.hashType == 2 {
