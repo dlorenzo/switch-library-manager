@@ -231,19 +231,28 @@ func OrganizeByFolders(baseFolder string,
 			from = filepath.Join(updateInfo.ExtendedInfo.BaseFolder, updateInfo.ExtendedInfo.FileName)
 			if options.CreateFolderPerGame {
 				if options.UpdatesFolder != "" {
-					to = filepath.Join(destinationPath, options.UpdatesFolder)
-					createFolder(to, logger)
-					to = filepath.Join(to, getFileName(options, updateInfo.ExtendedInfo.FileName, templateData, 0))
+					targetDir, err := resolveSubDir(destinationPath, options.UpdatesFolder)
+					if err != nil {
+						logger.Errorf("Invalid updates folder [%v]: %v", options.UpdatesFolder, err)
+						continue
+					}
+					if err := createFolder(targetDir, logger); err != nil {
+						continue
+					}
+					to = filepath.Join(targetDir, getFileName(options, updateInfo.ExtendedInfo.FileName, templateData, 0))
 				} else {
 					to = filepath.Join(destinationPath, getFileName(options, updateInfo.ExtendedInfo.FileName, templateData, 0))
 				}
 			} else {
 				if options.UpdatesFolder != "" {
-					targetDir := options.UpdatesFolder
-					if !filepath.IsAbs(targetDir) {
-						targetDir = filepath.Join(baseFolder, targetDir)
+					targetDir, err := resolveSubDir(baseFolder, options.UpdatesFolder)
+					if err != nil {
+						logger.Errorf("Invalid updates folder [%v]: %v", options.UpdatesFolder, err)
+						continue
 					}
-					createFolder(targetDir, logger)
+					if err := createFolder(targetDir, logger); err != nil {
+						continue
+					}
 					to = filepath.Join(targetDir, getFileName(options, updateInfo.ExtendedInfo.FileName, templateData, 0))
 				} else {
 					to = filepath.Join(updateInfo.ExtendedInfo.BaseFolder, getFileName(options, updateInfo.ExtendedInfo.FileName, templateData, 0))
@@ -274,22 +283,32 @@ func OrganizeByFolders(baseFolder string,
 			from = filepath.Join(dlc.ExtendedInfo.BaseFolder, dlc.ExtendedInfo.FileName)
 
 			dlcNameTry := 0
+			to = ""
 			for {
 				if options.CreateFolderPerGame {
 					if options.DlcFolder != "" {
-						to = filepath.Join(destinationPath, options.DlcFolder)
-						createFolder(to, logger)
-						to = filepath.Join(to, getFileName(options, dlc.ExtendedInfo.FileName, templateData, dlcNameTry))
+						targetDir, err := resolveSubDir(destinationPath, options.DlcFolder)
+						if err != nil {
+							logger.Errorf("Invalid DLC folder [%v]: %v", options.DlcFolder, err)
+							break
+						}
+						if err := createFolder(targetDir, logger); err != nil {
+							break
+						}
+						to = filepath.Join(targetDir, getFileName(options, dlc.ExtendedInfo.FileName, templateData, dlcNameTry))
 					} else {
 						to = filepath.Join(destinationPath, getFileName(options, dlc.ExtendedInfo.FileName, templateData, dlcNameTry))
 					}
 				} else {
 					if options.DlcFolder != "" {
-						targetDir := options.DlcFolder
-						if !filepath.IsAbs(targetDir) {
-							targetDir = filepath.Join(baseFolder, targetDir)
+						targetDir, err := resolveSubDir(baseFolder, options.DlcFolder)
+						if err != nil {
+							logger.Errorf("Invalid DLC folder [%v]: %v", options.DlcFolder, err)
+							break
 						}
-						createFolder(targetDir, logger)
+						if err := createFolder(targetDir, logger); err != nil {
+							break
+						}
 						to = filepath.Join(targetDir, getFileName(options, dlc.ExtendedInfo.FileName, templateData, dlcNameTry))
 					} else {
 						to = filepath.Join(dlc.ExtendedInfo.BaseFolder, getFileName(options, dlc.ExtendedInfo.FileName, templateData, dlcNameTry))
@@ -307,6 +326,14 @@ func OrganizeByFolders(baseFolder string,
 				}
 
 				dlcNameTry++
+				if dlcNameTry > 100 {
+					logger.Errorf("Too many DLC name collisions for %v", id)
+					to = ""
+					break
+				}
+			}
+			if to == "" {
+				continue
 			}
 			existingDlcs[to] = id
 
@@ -368,12 +395,13 @@ func IsOptionsValid(options settings.OrganizeOptions) bool {
 }
 
 func getDlcName(switchTitle *db.SwitchTitle, file db.SwitchFileInfo) string {
-	if switchTitle == nil {
+	if switchTitle == nil || file.Metadata == nil {
 		return ""
 	}
 	if dlcAttributes, ok := switchTitle.Dlc[file.Metadata.TitleId]; ok {
 		name := dlcAttributes.Name
 		name = strings.ReplaceAll(name, "\n", " ")
+		name = strings.ReplaceAll(name, "\r", " ")
 		return name
 	}
 	return ""
@@ -384,7 +412,7 @@ func getTitleName(switchTitle *db.SwitchTitle, v *db.SwitchGameFiles) string {
 	if switchTitle != nil && switchTitle.Attributes.Name != "" {
 		res := cjk.FindAllString(switchTitle.Attributes.Name, -1)
 		if len(res) == 0 {
-			return switchTitle.Attributes.Name
+			return sanitizeTitleName(switchTitle.Attributes.Name)
 		}
 	}
 
@@ -393,17 +421,56 @@ func getTitleName(switchTitle *db.SwitchTitle, v *db.SwitchGameFiles) string {
 		// Check if the title name exists
 		name := v.File.Metadata.Ncap.TitleName["AmericanEnglish"].Title
 		if name != "" {
-			return name
+			return sanitizeTitleName(name)
 		}
 	}
 
 	// For non-eShop games, get the name from the file
 	if v != nil {
-		return db.ParseTitleNameFromFileName(v.File.ExtendedInfo.FileName)
+		return sanitizeTitleName(db.ParseTitleNameFromFileName(v.File.ExtendedInfo.FileName))
 	}
 
 	// Default return if no valid name is found
 	return "Unknown Title"
+}
+
+func sanitizeTitleName(s string) string {
+	s = strings.ReplaceAll(s, "\n", " ")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7F {
+			return -1
+		}
+		return r
+	}, s)
+	s = strings.TrimSpace(s)
+	if len(s) > 200 {
+		s = s[:200]
+	}
+	if s == "" {
+		return "Unknown Title"
+	}
+	return s
+}
+
+// resolveSubDir joins a user-configured subfolder onto base and ensures the
+// result stays inside base (rejects absolute paths and ../../ escapes).
+func resolveSubDir(base, sub string) (string, error) {
+	if sub == "" {
+		return base, nil
+	}
+	if filepath.IsAbs(sub) {
+		return "", errors.New("absolute subfolder not allowed: " + sub)
+	}
+	joined := filepath.Join(base, sub)
+	rel, err := filepath.Rel(base, joined)
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", errors.New("subfolder escapes library root: " + sub)
+	}
+	return joined, nil
 }
 
 func getFolderName(options settings.OrganizeOptions, templateData map[string]string) string {
@@ -450,30 +517,40 @@ func copyAndDelete(from string, to string) error {
 	if err != nil {
 		return err
 	}
-	defer srcFile.Close()
 
 	srcInfo, err := srcFile.Stat()
 	if err != nil {
+		srcFile.Close()
 		return err
 	}
 
-	dstFile, err := os.OpenFile(to, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, srcInfo.Mode())
+	dstFile, err := os.OpenFile(to, os.O_WRONLY|os.O_CREATE|os.O_EXCL, srcInfo.Mode())
 	if err != nil {
+		srcFile.Close()
 		return err
 	}
 
 	_, err = io.Copy(dstFile, srcFile)
+	syncErr := dstFile.Sync()
 	closeErr := dstFile.Close()
+	// Windows locks open files: release the source handle before removing it.
+	srcCloseErr := srcFile.Close()
 	if err != nil {
 		_ = os.Remove(to)
 		return err
+	}
+	if syncErr != nil {
+		_ = os.Remove(to)
+		return syncErr
 	}
 	if closeErr != nil {
 		_ = os.Remove(to)
 		return closeErr
 	}
+	if srcCloseErr != nil {
+		return srcCloseErr
+	}
 
-	srcFile.Close()
 	return os.Remove(from)
 }
 

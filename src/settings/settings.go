@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/go-version"
@@ -16,6 +17,7 @@ import (
 
 var (
 	settingsInstance *AppSettings
+	settingsMu       sync.RWMutex
 )
 
 const (
@@ -80,37 +82,59 @@ type AppSettings struct {
 }
 
 func ReadSettingsAsJSON(baseFolder string) string {
-	if _, err := os.Stat(filepath.Join(baseFolder, SETTINGS_FILENAME)); err != nil {
+	settingsPath := filepath.Join(baseFolder, SETTINGS_FILENAME)
+	if _, err := os.Stat(settingsPath); err != nil {
 		saveDefaultSettings(baseFolder)
 	}
-	file, err := os.Open(filepath.Join(baseFolder, SETTINGS_FILENAME))
+	data, err := os.ReadFile(settingsPath)
 	if err != nil {
-		return ""
+		zap.S().Warnf("failed to read settings file: %v", err)
+		return "{}"
 	}
-	defer file.Close()
-	bytes, _ := io.ReadAll(file)
-	return string(bytes)
+	return string(data)
+}
+
+func cloneSettings(s *AppSettings) *AppSettings {
+	if s == nil {
+		return nil
+	}
+	c := *s
+	c.ScanFolders = append([]string(nil), s.ScanFolders...)
+	c.IgnoreDLCTitleIds = append([]string(nil), s.IgnoreDLCTitleIds...)
+	c.IgnoreUpdateTitleIds = append([]string(nil), s.IgnoreUpdateTitleIds...)
+	c.IgnoreFileTypes = append([]string(nil), s.IgnoreFileTypes...)
+	return &c
 }
 
 func ReadSettings(baseFolder string) *AppSettings {
+	settingsMu.RLock()
 	if settingsInstance != nil {
-		return settingsInstance
+		c := cloneSettings(settingsInstance)
+		settingsMu.RUnlock()
+		return c
 	}
-	settingsInstance = &AppSettings{Debug: false, GuiPagingSize: 100, ScanFolders: []string{},
-		OrganizeOptions: OrganizeOptions{SwitchSafeFileNames: true, PrioritizeCompressed: true}, Prodkeys: "", IgnoreDLCTitleIds: []string{"01007F600B135007"}}
+	settingsMu.RUnlock()
+
+	settingsMu.Lock()
+	defer settingsMu.Unlock()
+	if settingsInstance != nil {
+		return cloneSettings(settingsInstance)
+	}
 	if _, err := os.Stat(filepath.Join(baseFolder, SETTINGS_FILENAME)); err == nil {
-		file, err := os.Open(filepath.Join(baseFolder, SETTINGS_FILENAME))
+		data, err := os.ReadFile(filepath.Join(baseFolder, SETTINGS_FILENAME))
 		if err != nil {
-			zap.S().Warnf("Missing or corrupted config file, creating a new one")
-			return saveDefaultSettings(baseFolder)
+			zap.S().Warnf("Missing or corrupted config file, creating a new one: %v", err)
+			return saveDefaultSettingsLocked(baseFolder)
 		}
-		defer file.Close()
-		_ = json.NewDecoder(file).Decode(&settingsInstance)
-		settingsInstance = verifySettings(baseFolder, settingsInstance)
-		return settingsInstance
-	} else {
-		return saveDefaultSettings(baseFolder)
+		decoded := &AppSettings{}
+		if err := json.Unmarshal(data, decoded); err != nil {
+			zap.S().Warnf("Corrupted settings.json, recreating defaults: %v", err)
+			return saveDefaultSettingsLocked(baseFolder)
+		}
+		settingsInstance = verifySettings(baseFolder, decoded)
+		return cloneSettings(settingsInstance)
 	}
+	return saveDefaultSettingsLocked(baseFolder)
 }
 
 func verifySettings(baseFolder string, settings *AppSettings) *AppSettings {
@@ -143,6 +167,12 @@ func verifySettings(baseFolder string, settings *AppSettings) *AppSettings {
 }
 
 func saveDefaultSettings(baseFolder string) *AppSettings {
+	settingsMu.Lock()
+	defer settingsMu.Unlock()
+	return saveDefaultSettingsLocked(baseFolder)
+}
+
+func saveDefaultSettingsLocked(baseFolder string) *AppSettings {
 	settingsInstance = &AppSettings{
 		TitlesJsonUrl:          DEFAULT_TITLES_JSON_URL,
 		TitlesEtag:             "",
@@ -182,22 +212,49 @@ func saveDefaultSettings(baseFolder string) *AppSettings {
 		},
 		DarkMode: true,
 	}
-	return SaveSettings(settingsInstance, baseFolder)
+	return saveSettingsLocked(settingsInstance, baseFolder)
 }
 
 func SaveSettings(settings *AppSettings, baseFolder string) *AppSettings {
-	file, err := json.MarshalIndent(settings, "", " ")
+	settingsMu.Lock()
+	defer settingsMu.Unlock()
+	return saveSettingsLocked(settings, baseFolder)
+}
+
+func saveSettingsLocked(settings *AppSettings, baseFolder string) *AppSettings {
+	data, err := json.MarshalIndent(settings, "", " ")
 	if err != nil {
 		zap.S().Errorf("failed to marshal settings: %v", err)
 		return settings
 	}
-	if err := os.WriteFile(filepath.Join(baseFolder, SETTINGS_FILENAME), file, 0600); err != nil {
-		// A failed save previously went completely unnoticed. Log it so a
-		// read-only or full disk doesn't silently drop the user's settings.
+	// Atomic write: temp + rename so a crash never leaves half-written JSON.
+	tmp, err := os.CreateTemp(baseFolder, "settings-*.tmp")
+	if err != nil {
 		zap.S().Errorf("failed to write settings file: %v", err)
+		return settings
 	}
-	settingsInstance = settings
-	return settings
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		zap.S().Errorf("failed to write settings file: %v", err)
+		tmp.Close()
+		os.Remove(tmpName)
+		return settings
+	}
+	if err := tmp.Close(); err != nil {
+		zap.S().Errorf("failed to write settings file: %v", err)
+		os.Remove(tmpName)
+		return settings
+	}
+	if err := os.Chmod(tmpName, 0600); err != nil {
+		zap.S().Warnf("failed to chmod settings file: %v", err)
+	}
+	if err := os.Rename(tmpName, filepath.Join(baseFolder, SETTINGS_FILENAME)); err != nil {
+		zap.S().Errorf("failed to write settings file: %v", err)
+		os.Remove(tmpName)
+		return settings
+	}
+	settingsInstance = cloneSettings(settings)
+	return cloneSettings(settings)
 }
 
 func CheckForUpdates() (bool, error) {

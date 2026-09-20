@@ -1,4 +1,13 @@
 // --- UI & IPC Helpers (Electron remote module disabled) -------------------
+function safeParse(payload, fallback) {
+    try {
+        if (!payload) return fallback;
+        return JSON.parse(payload);
+    } catch (e) {
+        console.error("Failed to parse IPC payload", e);
+        return fallback;
+    }
+}
 function showMessageBox(options, callback) {
     let title = (options && options.title) ? options.title : "";
     let msg = (options && options.message) ? options.message : "";
@@ -151,7 +160,8 @@ $(function () {
         };
 
         sendMessage("loadSettings", "", function (message) {
-            state.settings = JSON.parse(message);
+            state.settings = safeParse(message, {}) || {};
+            state.settings.organize_options = state.settings.organize_options || {};
 
             if(state.settings.hide_missing_games){
                 document.getElementById("tab_btns").classList.add("hide_missing_games");
@@ -201,12 +211,15 @@ $(function () {
             // console.log(message)
             let pcg = 0
             if (message.name === "updateProgress") {
-                let pp = JSON.parse(message.payload);
-                let count = pp.curr;
-                let total = pp.total;
-                $('.progress-msg').text(pp.message);
-                if (count !== -1 && total !== -1){
+                let pp = safeParse(message.payload, null);
+                if (!pp) return;
+                let count = Number(pp.curr) || 0;
+                let total = Number(pp.total) || 0;
+                $('.progress-msg').text(String(pp.message || ""));
+                if (total > 0){
                     pcg = Math.floor(count / total * 100);
+                    if (!isFinite(pcg) || pcg < 0) pcg = 0;
+                    if (pcg > 100) pcg = 100;
                     $('.progress-bar').attr('aria-valuenow', pcg);
                     $('.progress-bar').attr('style', 'width:' + Number(pcg) + '%');
                     $('.progress-bar').text(pcg + "%");
@@ -218,11 +231,15 @@ $(function () {
                 }
             }
             else if (message.name === "libraryLoaded") {
-                state.library = JSON.parse(message.payload);
+                state.library = safeParse(message.payload, null);
+                if (!state.library || !Array.isArray(state.library.library_data)) {
+                    state.library = { library_data: [], issues: [], num_files: 0 };
+                }
                 loadTab("#library")
             }
             else if (message.name === "missingGames") {
-                state.missingGames = JSON.parse(message.payload);
+                state.missingGames = safeParse(message.payload, []);
+                if (!Array.isArray(state.missingGames)) state.missingGames = [];
                 loadTab("#missing")
             }
             else if (message.name === "error") {
@@ -308,12 +325,13 @@ $(function () {
                 let html = $(target + "Template").render({folder: state.settings.folder,settings:state.settings})
                 $(target).html(html);
             } else if (target === "#updates") {
+                if (!state.settings) return;
                 if (state.settings.folder && !state.library){
                     return
                 }
                 if (state.library && !state.updates){
                     sendMessage("missingUpdates", "", (r => {
-                        state.updates = JSON.parse(r)
+                        state.updates = safeParse(r, [])
                         loadTab("#updates")
                     }));
                     return
@@ -327,7 +345,7 @@ $(function () {
                             {column:"latest_update_date", dir:"desc"}, //sort by this first
                         ],
                         pagination: "local",
-                        paginationSize: state.settings.gui_page_size,
+                        paginationSize: state.settings.gui_page_size > 0 ? state.settings.gui_page_size : 100,
                         data: state.updates,
                         columns: [
                             {title: "Game", field: "Attributes.name", headerFilter:"input", formatter:fluentTitleFormatter, width:400},
@@ -340,12 +358,13 @@ $(function () {
                     });
                 }
             } else if (target === "#dlc") {
+                if (!state.settings) return;
                 if (state.settings.folder && !state.library){
                     return
                 }
                 if (state.library && !state.dlc){
                     sendMessage("missingDlc", "", (r => {
-                        state.dlc = JSON.parse(r)
+                        state.dlc = safeParse(r, [])
                         loadTab("#dlc")
                     }));
                     return
@@ -503,7 +522,7 @@ $(function () {
                 }
                 if (state.library && !state.missingGames){
                     sendMessage("missingGames", "", (r => {
-                        state.missingGames = JSON.parse(r)
+                        state.missingGames = safeParse(r, [])
                         loadTab("#missing")
                     }));
                     return

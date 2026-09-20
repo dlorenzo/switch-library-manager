@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"go.uber.org/zap"
 	"io"
 	"strings"
@@ -18,17 +19,26 @@ func ReadXciMetadata(filePath string) (map[string]*ContentMetaAttributes, error)
 	defer file.Close()
 
 	header := make([]byte, 0x200)
-	_, err = file.ReadAt(header, 0)
+	n, err := file.ReadAt(header, 0)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to read XCI header: %w", err)
+	}
+	if n != 0x200 {
+		return nil, fmt.Errorf("short read of XCI header: %d", n)
 	}
 
 	if string(header[0x100:0x104]) != "HEAD" {
-		return nil, errors.New("Invalid XCI headerBytes. Expected 'HEAD', got '" + string(header[:0x4]) + "'")
+		return nil, errors.New("Invalid XCI headerBytes. Expected 'HEAD', got '" + string(header[0x100:0x104]) + "'")
 	}
 
 	rootPartitionOffset := binary.LittleEndian.Uint64(header[0x130:0x138])
 	//rootPartitionSize := binary.LittleEndian.Uint64(header[0x138:0x140])
+	if rootPartitionOffset > 1<<62 {
+		return nil, fmt.Errorf("invalid XCI root offset %d", rootPartitionOffset)
+	}
+	if int64(rootPartitionOffset) < 0 {
+		return nil, errors.New("invalid XCI root offset: overflow")
+	}
 
 	rootHfs0, err := readPfs0(file, int64(rootPartitionOffset))
 	if err != nil {
@@ -44,6 +54,9 @@ func ReadXciMetadata(filePath string) (map[string]*ContentMetaAttributes, error)
 
 	for _, pfs0File := range secureHfs0.Files {
 
+		if pfs0File.StartOffset > 1<<62 || uint64(secureOffset) > 1<<62-pfs0File.StartOffset {
+			return nil, errors.New("invalid file offset: overflow")
+		}
 		fileOffset := secureOffset + int64(pfs0File.StartOffset)
 
 		if strings.Contains(pfs0File.Name, "cnmt.nca") {
@@ -84,21 +97,34 @@ func ReadXciMetadata(filePath string) (map[string]*ContentMetaAttributes, error)
 			contentMap[currCnmt.TitleId] = currCnmt
 		}*/
 	}
+	if len(contentMap) == 0 {
+		return nil, errors.New("no cnmt.nca found in XCI")
+	}
 
 	return contentMap, nil
 }
 
 func getNcaById(hfs0 *PFS0, id string) *fileEntry {
-	for _, fileEntry := range hfs0.Files {
-		if strings.Contains(fileEntry.Name, id) {
-			return &fileEntry
+	if hfs0 == nil {
+		return nil
+	}
+	for i := range hfs0.Files {
+		if strings.Contains(hfs0.Files[i].Name, id) {
+			return &hfs0.Files[i]
 		}
 	}
 	return nil
 }
 
 func readSecurePartition(file io.ReaderAt, hfs0 *PFS0, rootPartitionOffset uint64) (*PFS0, int64, error) {
-	for _, hfs0File := range hfs0.Files {
+	if hfs0 == nil {
+		return nil, 0, errors.New("invalid root partition")
+	}
+	for i := range hfs0.Files {
+		hfs0File := hfs0.Files[i]
+		if hfs0File.StartOffset > 1<<62 || rootPartitionOffset > 1<<62-hfs0File.StartOffset {
+			return nil, 0, errors.New("invalid secure partition offset: overflow")
+		}
 		offset := int64(rootPartitionOffset) + int64(hfs0File.StartOffset)
 
 		if hfs0File.Name == "secure" {
@@ -109,5 +135,5 @@ func readSecurePartition(file io.ReaderAt, hfs0 *PFS0, rootPartitionOffset uint6
 			return securePartition, offset, nil
 		}
 	}
-	return nil, 0, nil
+	return nil, 0, errors.New("secure partition not found")
 }

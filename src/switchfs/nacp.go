@@ -40,6 +40,9 @@ type Nacp struct {
 }
 
 func (l Language) String() string {
+	if l < AmericanEnglish || l > BrazilianPortuguese {
+		return "Unknown"
+	}
 	return [...]string{
 		"AmericanEnglish",
 		"BritishEnglish",
@@ -84,9 +87,9 @@ func ExtractNacp(cnmt *ContentMetaAttributes, file io.ReaderAt, securePartition 
 					}
 					return &nacp, nil
 				}
-			} else {
-				return nil, errors.New("unsupported type " + control.ID)
-			}
+		} else {
+			return nil, errors.New("unsupported NACP container type " + control.ID)
+		}
 		} else {
 			return nil, errors.New("unable to find control.nacp by id " + control.ID)
 		}
@@ -98,6 +101,9 @@ func ExtractNacp(cnmt *ContentMetaAttributes, file io.ReaderAt, securePartition 
 /*https://switchbrew.org/wiki/NACP_Format*/
 func readNacp(data []byte, romFsHeader RomfsHeader, fileEntry RomfsFileEntry) (Nacp, error) {
 	offset := romFsHeader.DataOffset + fileEntry.offset
+	if offset < romFsHeader.DataOffset || offset+0x3070 < offset {
+		return Nacp{}, errors.New("failed to read nacp: offset overflow")
+	}
 	// The NACP fields we read span up to offset+0x3070; ensure the buffer covers
 	// that range before indexing, otherwise a malformed control.nacp panics.
 	if offset > uint64(len(data)) || offset+0x3070 > uint64(len(data)) {

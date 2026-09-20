@@ -2,11 +2,13 @@ package switchfs
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/avast/retry-go/v5"
 )
@@ -21,6 +23,7 @@ type splitFile struct {
 	files     []ReadAtCloser
 	path      string
 	chunkSize int64
+	mu        sync.Mutex
 }
 
 type fileWrapper struct {
@@ -117,27 +120,31 @@ func NewSplitFileReader(filePath string) (*splitFile, error) {
 	if len(matchedParts) == 0 {
 		return nil, errors.New("no split files found")
 	}
+	if maxPart >= maxSplitParts {
+		return nil, fmt.Errorf("too many split parts: %d (max %d)", maxPart+1, maxSplitParts)
+	}
+	// Guard against sparse attacker-controlled numbering like "file.999999999"
+	// creating a giant slice via maxPart+1.
+	if len(matchedParts) < maxPart+1 && maxPart > 2*len(matchedParts)+10 {
+		return nil, fmt.Errorf("sparse split numbering: max=%d count=%d", maxPart, len(matchedParts))
+	}
 
 	result.path = dir
 	result.info = make([]os.FileInfo, maxPart+1)
 	result.files = make([]ReadAtCloser, maxPart+1)
 
 	for _, p := range matchedParts {
+		if p.num < 0 || p.num > maxPart {
+			continue
+		}
 		result.info[p.num] = p.info
 	}
 
-	// Determine chunk size from part 0
-	if result.info[0] != nil {
-		result.chunkSize = result.info[0].Size()
-	} else {
-		// fallback to the size of the first available part
-		for _, info := range result.info {
-			if info != nil {
-				result.chunkSize = info.Size()
-				break
-			}
-		}
+	// Chunk size must come from part 0; other parts may be short (last part).
+	if result.info[0] == nil {
+		return nil, errors.New("split set is missing part 0")
 	}
+	result.chunkSize = result.info[0].Size()
 
 	if result.chunkSize == 0 {
 		return nil, errors.New("chunk size is 0 or no parts found")
@@ -159,11 +166,17 @@ func (sp *splitFile) ReadAt(p []byte, off int64) (n int, err error) {
 	if off < 0 {
 		return 0, errors.New("negative offset")
 	}
+	if sp.chunkSize <= 0 {
+		return 0, errors.New("invalid chunk size")
+	}
 
 	lastPart := len(sp.info) - 1
 
 	for n < len(p) {
 		pos := off + int64(n)
+		if pos < off {
+			return n, errors.New("offset overflow")
+		}
 		part := int(pos / sp.chunkSize)
 
 		// Past the final part => genuine end of the (virtual) file.
@@ -175,13 +188,17 @@ func (sp *splitFile) ReadAt(p []byte, off int64) (n int, err error) {
 			return n, errors.New("missing part " + strconv.Itoa(part))
 		}
 
+		sp.mu.Lock()
 		if sp.files[part] == nil {
 			file, ferr := _openFile(filepath.Join(sp.path, sp.info[part].Name()))
 			if ferr != nil {
+				sp.mu.Unlock()
 				return n, ferr
 			}
 			sp.files[part] = file
 		}
+		f := sp.files[part]
+		sp.mu.Unlock()
 
 		partOff := pos - sp.chunkSize*int64(part)
 		partSize := sp.info[part].Size()
@@ -201,7 +218,7 @@ func (sp *splitFile) ReadAt(p []byte, off int64) (n int, err error) {
 			toRead = remain
 		}
 
-		m, rerr := sp.files[part].ReadAt(p[n:n+int(toRead)], partOff)
+		m, rerr := f.ReadAt(p[n:n+int(toRead)], partOff)
 		n += m
 
 		if int64(m) < toRead {
@@ -240,12 +257,17 @@ func _openFile(path string) (*os.File, error) {
 }
 
 func (sp *splitFile) Close() error {
+	var firstErr error
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
 	for _, file := range sp.files {
 		if file != nil {
-			file.Close()
+			if err := file.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
-	return nil
+	return firstErr
 }
 
 func OpenFile(filePath string) (ReadAtCloser, error) {

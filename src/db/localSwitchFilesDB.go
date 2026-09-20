@@ -23,7 +23,7 @@ import (
 
 var (
 	versionRegex = regexp.MustCompile(`\[[vV]?(?P<version>[0-9]{1,10})]`)
-	titleIdRegex = regexp.MustCompile(`\[(?P<titleId>[A-Za-z0-9]{16})]`)
+	titleIdRegex = regexp.MustCompile(`\[(?P<titleId>[0-9A-Fa-f]{16})]`)
 )
 
 const (
@@ -127,9 +127,27 @@ func (ldb *LocalSwitchDBManager) CreateLocalSwitchFilesDB(folders []string,
 	files := []ExtendedFileInfo{}
 
 	if !ignoreCache {
-		ldb.db.GetEntry(DB_TABLE_LOCAL_LIBRARY, "files", &files)
-		ldb.db.GetEntry(DB_TABLE_LOCAL_LIBRARY, "skipped", &skipped)
-		ldb.db.GetEntry(DB_TABLE_LOCAL_LIBRARY, "titles", &titles)
+		if err := ldb.db.GetEntry(DB_TABLE_LOCAL_LIBRARY, "files", &files); err != nil {
+			zap.S().Warnf("ignoring corrupt files cache: %v", err)
+			files = []ExtendedFileInfo{}
+		}
+		if err := ldb.db.GetEntry(DB_TABLE_LOCAL_LIBRARY, "skipped", &skipped); err != nil {
+			zap.S().Warnf("ignoring corrupt skipped cache: %v", err)
+			skipped = map[ExtendedFileInfo]SkippedFile{}
+		}
+		if err := ldb.db.GetEntry(DB_TABLE_LOCAL_LIBRARY, "titles", &titles); err != nil {
+			zap.S().Warnf("ignoring corrupt titles cache: %v", err)
+			titles = map[string]*SwitchGameFiles{}
+		}
+		if titles == nil {
+			titles = map[string]*SwitchGameFiles{}
+		}
+		if skipped == nil {
+			skipped = map[ExtendedFileInfo]SkippedFile{}
+		}
+		if files == nil {
+			files = []ExtendedFileInfo{}
+		}
 	}
 
 	if len(titles) == 0 {
@@ -404,10 +422,19 @@ func (ldb *LocalSwitchDBManager) processLocalFiles(files []ExtendedFileInfo,
 
 		for _, metadata := range orderedMetadata {
 
-			id := metadata.TitleId
+			id := strings.ToLower(metadata.TitleId)
+			if len(id) != 16 {
+				continue
+			}
+			if _, err := strconv.ParseUint(id, 16, 64); err != nil {
+				continue
+			}
 			idPrefix := id[0 : len(id)-3]
 			if !(strings.HasSuffix(id, "000") || strings.HasSuffix(id, "800")) {
-				intVar, _ := strconv.ParseUint(id[len(id)-4:len(id)-3], 16, 64)
+				intVar, err := strconv.ParseUint(id[len(id)-4:len(id)-3], 16, 64)
+				if err != nil || intVar == 0 {
+					continue
+				}
 				h := fmt.Sprintf("%x", intVar-1)
 				idPrefix = id[0:len(id)-4] + h
 			}

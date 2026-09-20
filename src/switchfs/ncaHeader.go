@@ -25,6 +25,9 @@ type ncaHeader struct {
 }
 
 func (n *ncaHeader) HasRightsId() bool {
+	if n == nil || len(n.rightsId) < 0x10 {
+		return false
+	}
 	for i := 0; i < 0x10; i++ {
 		if n.rightsId[i] != 0 {
 			return true
@@ -50,7 +53,16 @@ func max(a byte, b byte) byte {
 }
 
 func DecryptNcaHeader(key string, encHeader []byte) (*ncaHeader, error) {
-	headerKey, _ := hex.DecodeString(key)
+	if len(encHeader) < 0xC00 {
+		return nil, fmt.Errorf("invalid NCA header: expected at least %d bytes, got %d", 0xC00, len(encHeader))
+	}
+	headerKey, err := hex.DecodeString(key)
+	if err != nil {
+		return nil, fmt.Errorf("invalid header key: %w", err)
+	}
+	if len(headerKey) != 32 {
+		return nil, fmt.Errorf("invalid header key length: expected 32 bytes, got %d", len(headerKey))
+	}
 	c, err := _crypto.NewCipher(aes.NewCipher, headerKey)
 	if err != nil {
 		return nil, err
@@ -90,13 +102,22 @@ func DecryptNcaHeader(key string, encHeader []byte) (*ncaHeader, error) {
 }
 
 func _decryptNcaHeader(c *_crypto.Cipher, header []byte, end int, sectorSize int, sectorNum int) ([]byte, error) {
+	if end < 0 || sectorSize <= 0 || end > len(header) {
+		return nil, fmt.Errorf("invalid NCA decrypt range: end=%d len=%d", end, len(header))
+	}
+	if end%sectorSize != 0 {
+		return nil, fmt.Errorf("invalid NCA decrypt range: end not a multiple of sector size")
+	}
 	decrypted := make([]byte, len(header))
 	for pos := 0; pos < end; pos += sectorSize {
 		/* Workaround for Nintendo's custom sector...manually generate the tweak. */
 		tweak := getNintendoTweak(sectorNum)
 
-		pos := sectorSize * sectorNum
-		c.Decrypt(decrypted[pos:pos+sectorSize], header[pos:pos+sectorSize], &tweak)
+		off := sectorSize * sectorNum
+		if off < 0 || off+sectorSize > len(header) || off+sectorSize > len(decrypted) {
+			return nil, fmt.Errorf("NCA decrypt out of range at sector %d", sectorNum)
+		}
+		c.Decrypt(decrypted[off:off+sectorSize], header[off:off+sectorSize], &tweak)
 		sectorNum++
 	}
 	return decrypted, nil

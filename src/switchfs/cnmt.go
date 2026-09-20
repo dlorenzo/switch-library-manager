@@ -81,7 +81,7 @@ func readBinaryCnmt(pfs0 *PFS0, data []byte) (*ContentMetaAttributes, error) {
 		// Compute the entry position in a wide int so the uint16 math cannot wrap,
 		// then bound-check against the buffer before slicing.
 		position := int(0x20) /*size of cnmt header*/ + int(tableOffset) + int(i)*0x38
-		if position+0x37 > len(cnmt) {
+		if position+0x38 > len(cnmt) || position < 0 {
 			return nil, errors.New("invalid cnmt: content entry out of range")
 		}
 		ncaId := cnmt[position+0x20 : position+0x20+0x10]
@@ -102,6 +102,8 @@ func readBinaryCnmt(pfs0 *PFS0, data []byte) (*ContentMetaAttributes, error) {
 			contentType = "LegalInformation"
 		case 6:
 			contentType = "DeltaFragment"
+		default:
+			return nil, fmt.Errorf("invalid cnmt: unknown content type %d", cnmt[position+0x36])
 		}
 		contents[contentType] = Content{ID: fmt.Sprintf("%x", ncaId)}
 	}
@@ -113,6 +115,8 @@ func readBinaryCnmt(pfs0 *PFS0, data []byte) (*ContentMetaAttributes, error) {
 		metaType = "DLC"
 	case ContentMetaType_Patch:
 		metaType = "UPD"
+	default:
+		return nil, fmt.Errorf("invalid cnmt: unknown meta type 0x%x", cnmt[0xC])
 	}
 
 	return &ContentMetaAttributes{Contents: contents, Version: int(version), TitleId: fmt.Sprintf("%016x", titleId), Type: metaType}, nil

@@ -3,6 +3,7 @@ package switchfs
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"go.uber.org/zap"
 	"strings"
 )
@@ -11,7 +12,7 @@ func ReadNspMetadata(filePath string) (map[string]*ContentMetaAttributes, error)
 
 	pfs0, err := ReadPfs0File(filePath)
 	if err != nil {
-		return nil, errors.New("Invalid NSP file, reason - [" + err.Error() + "]")
+		return nil, fmt.Errorf("Invalid NSP file, reason - [%w]", err)
 	}
 
 	file, err := OpenFile(filePath)
@@ -25,6 +26,9 @@ func ReadNspMetadata(filePath string) (map[string]*ContentMetaAttributes, error)
 
 	for _, pfs0File := range pfs0.Files {
 
+		if pfs0File.StartOffset > 1<<62 {
+			return nil, fmt.Errorf("invalid file offset %d for %s", pfs0File.StartOffset, pfs0File.Name)
+		}
 		fileOffset := int64(pfs0File.StartOffset)
 
 		if strings.Contains(pfs0File.Name, "cnmt.nca") {
@@ -63,6 +67,9 @@ func ReadNspMetadata(filePath string) (map[string]*ContentMetaAttributes, error)
 			}
 			contentMap[currCnmt.TitleId] = currCnmt
 		}*/
+	}
+	if len(contentMap) == 0 {
+		return nil, errors.New("no cnmt.nca found in NSP")
 	}
 	return contentMap, nil
 

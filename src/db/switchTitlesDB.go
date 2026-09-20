@@ -63,7 +63,10 @@ func CreateSwitchTitleDB(titlesFile, versionsFile io.Reader) (*SwitchTitlesDB, e
 	// safe upper bound.
 	result := SwitchTitlesDB{TitlesMap: make(map[string]*SwitchTitle, len(titles))}
 	for id, attr := range titles {
-		if len(id) < 16 {
+		if len(id) != 16 {
+			continue
+		}
+		if _, err := strconv.ParseUint(id, 16, 64); err != nil {
 			continue
 		}
 		id = strings.ToLower(id)
@@ -75,7 +78,10 @@ func CreateSwitchTitleDB(titlesFile, versionsFile io.Reader) (*SwitchTitlesDB, e
 		//have a running counter (starting with 001) in the 3 last chars
 		idPrefix := id[0 : len(id)-3]
 		if !(strings.HasSuffix(id, "000") || strings.HasSuffix(id, "800")) {
-			intVar, _ := strconv.ParseUint(id[len(id)-4:len(id)-3], 16, 64)
+			intVar, err := strconv.ParseUint(id[len(id)-4:len(id)-3], 16, 64)
+			if err != nil || intVar == 0 {
+				continue
+			}
 			h := fmt.Sprintf("%x", intVar-1)
 			idPrefix = id[0:len(id)-4] + h
 		}

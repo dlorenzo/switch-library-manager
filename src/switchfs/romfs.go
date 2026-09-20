@@ -3,6 +3,7 @@ package switchfs
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 )
 
 type RomfsHeader struct {
@@ -48,8 +49,8 @@ func readRomfsHeader(data []byte) (RomfsHeader, error) {
 }
 
 func readRomfsFileEntry(data []byte, header RomfsHeader) (map[string]RomfsFileEntry, error) {
-	if header.FileMetaTableOffset > uint64(len(data)) || header.FileMetaTableOffset+header.FileMetaTableSize > uint64(len(data)) {
-		return nil, errors.New("failed to read romfs")
+	if err := checkRange(header.FileMetaTableOffset, header.FileMetaTableSize, uint64(len(data))); err != nil {
+		return nil, fmt.Errorf("failed to read romfs: %w", err)
 	}
 	dirBytes := data[header.FileMetaTableOffset : header.FileMetaTableOffset+header.FileMetaTableSize]
 	result := map[string]RomfsFileEntry{}
@@ -57,8 +58,8 @@ func readRomfsFileEntry(data []byte, header RomfsHeader) (map[string]RomfsFileEn
 	offset := uint64(0x0)
 	for offset < dirLen {
 		// Need at least the 0x20-byte fixed entry header before reading fields.
-		if offset+0x20 > dirLen {
-			break
+		if offset+0x20 > dirLen || offset+0x20 < offset {
+			return nil, errors.New("failed to read romfs: truncated entry")
 		}
 		entry := RomfsFileEntry{}
 		entry.parent = binary.LittleEndian.Uint32(dirBytes[offset : offset+0x4])
@@ -71,8 +72,8 @@ func readRomfsFileEntry(data []byte, header RomfsHeader) (map[string]RomfsFileEn
 		// The name length is file-controlled; bound it against the buffer.
 		nameStart := offset + 0x20
 		nameEnd := nameStart + uint64(entry.name_size)
-		if nameEnd > dirLen {
-			break
+		if nameEnd < nameStart || nameEnd > dirLen {
+			return nil, errors.New("failed to read romfs: entry name out of range")
 		}
 		entry.name = string(dirBytes[nameStart:nameEnd])
 		result[entry.name] = entry

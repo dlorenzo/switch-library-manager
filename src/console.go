@@ -4,7 +4,6 @@ import (
 	"encoding/csv"
 	"fmt"
 	"os"
-	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -143,7 +142,7 @@ func (c *Console) Start() {
 	}
 	defer localDbManager.Close()
 
-	scanFolders := settingsObj.ScanFolders
+	scanFolders := append([]string{}, settingsObj.ScanFolders...)
 	scanFolders = append(scanFolders, folderToScan)
 
 	localDB, err := localDbManager.CreateLocalSwitchFilesDB(scanFolders, c, recursiveMode, true)
@@ -223,12 +222,12 @@ func (c *Console) processIssues(localDB *db.LocalSwitchFilesDB, csvOutput string
 	t.AppendHeader(table.Row{"#", "Skipped file", "Reason"})
 	i := 0
 	for k, v := range localDB.Skipped {
-		csv.Write([]string{path.Join(k.BaseFolder, k.FileName), v.ReasonText, strconv.Itoa(v.ReasonCode)})
+		csv.Write([]string{filepath.Join(k.BaseFolder, k.FileName), v.ReasonText, strconv.Itoa(v.ReasonCode)})
 
-		t.AppendRow([]interface{}{i, path.Join(k.BaseFolder, k.FileName), v})
+		t.AppendRow([]interface{}{i, filepath.Join(k.BaseFolder, k.FileName), v})
 		i++
 	}
-	t.AppendFooter(table.Row{"", "", "", "", "Total", len(localDB.Skipped)})
+	t.AppendFooter(table.Row{"Total", len(localDB.Skipped)})
 	t.Render()
 
 	csv.Close()
@@ -261,7 +260,7 @@ func (c *Console) processMissingUpdates(localDB *db.LocalSwitchFilesDB, titlesDB
 		t.AppendRow([]interface{}{i, v.Attributes.Name, v.Attributes.Id, v.LocalUpdate, v.LatestUpdate, v.LatestUpdateDate})
 		i++
 	}
-	t.AppendFooter(table.Row{"", "", "", "", "Total", len(incompleteTitles)})
+	t.AppendFooter(table.Row{"Total", len(incompleteTitles)})
 	t.Render()
 
 	csv.Close()
@@ -296,13 +295,25 @@ func (c *Console) processMissingDLC(localDB *db.LocalSwitchFilesDB, titlesDB *db
 		t.AppendRow([]interface{}{i, v.Attributes.Name, v.Attributes.Id, strings.Join(v.MissingDLC, "\n")})
 		i++
 	}
-	t.AppendFooter(table.Row{"", "", "", "", "Total", len(incompleteTitles)})
+	t.AppendFooter(table.Row{"Total", len(incompleteTitles)})
 	t.Render()
 
 	csv.Close()
 }
 
 func (c *Console) UpdateProgress(curr int, total int, message string) {
+	if progressBar == nil {
+		return
+	}
+	if total <= 0 {
+		return
+	}
+	if curr < 0 {
+		curr = 0
+	}
+	if curr > total {
+		curr = total
+	}
 	progressBar.ChangeMax(total)
 	progressBar.Set(curr)
 }
@@ -322,7 +333,11 @@ func CreateCsvFile(output string, header []string) *CsvFile {
 		}
 		writer := csv.NewWriter(file)
 
-		_ = writer.Write(header)
+		if err := writer.Write(header); err != nil {
+			zap.S().Errorf("Failed to write CSV header %v - %v", output, err)
+			file.Close()
+			return nil
+		}
 
 		instance := &CsvFile{Writer: writer, File: file}
 		return instance
@@ -335,15 +350,33 @@ func (csv *CsvFile) Close() {
 	if csv != nil {
 		if csv.Writer != nil {
 			csv.Writer.Flush()
+			if err := csv.Writer.Error(); err != nil {
+				zap.S().Errorf("Failed to flush CSV: %v", err)
+			}
 		}
 		if csv.File != nil {
-			csv.File.Close()
+			if err := csv.File.Close(); err != nil {
+				zap.S().Errorf("Failed to close CSV: %v", err)
+			}
 		}
 	}
 }
 
+func sanitizeCSVField(s string) string {
+	if s != "" && (s[0] == '=' || s[0] == '+' || s[0] == '-' || s[0] == '@') {
+		return "'" + s
+	}
+	return s
+}
+
 func (csv *CsvFile) Write(row []string) {
 	if csv != nil && csv.Writer != nil {
-		_ = csv.Writer.Write(row)
+		safe := make([]string, len(row))
+		for i, v := range row {
+			safe[i] = sanitizeCSVField(v)
+		}
+		if err := csv.Writer.Write(safe); err != nil {
+			zap.S().Errorf("Failed to write CSV row: %v", err)
+		}
 	}
 }

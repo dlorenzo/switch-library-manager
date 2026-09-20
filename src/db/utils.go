@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"go.uber.org/zap"
@@ -26,6 +27,19 @@ const httpTimeout = 60 * time.Second
 
 type ProgressUpdater interface {
 	UpdateProgress(curr int, total int, message string)
+}
+
+var sharedHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout: 3 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		MaxIdleConns:          10,
+		IdleConnTimeout:       60 * time.Second,
+	},
+	Timeout: httpTimeout,
 }
 
 func LoadAndUpdateFile(url string, filePath string, etag string) (*os.File, string, error) {
@@ -76,21 +90,11 @@ func downloadBytesFromUrl(url string, etag string) ([]byte, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	req.Header.Set("If-None-Match", etag)
-	transport := &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout: 3 * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
 	}
-	client := http.Client{
-		Transport: transport,
-		// Bound the whole request, not just the dial. Otherwise a server that
-		// connects and then stalls the response body hangs the app forever.
-		Timeout: httpTimeout,
-	}
-	resp, err := client.Do(req)
+	req.Header.Set("User-Agent", "switch-library-manager")
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return nil, "", err
 	}
@@ -120,10 +124,28 @@ func downloadBytesFromUrl(url string, etag string) ([]byte, string, error) {
 	return nil, "", errors.New("no new updates")
 }
 
-func saveFile(bytes []byte, fileName string) (*os.File, error) {
+func saveFile(data []byte, fileName string) (*os.File, error) {
 
-	err := os.WriteFile(fileName, bytes, 0644)
+	dir := filepath.Dir(fileName)
+	tmp, err := os.CreateTemp(dir, ".tmp-*.json")
 	if err != nil {
+		return nil, err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return nil, err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return nil, err
+	}
+	if err := os.Chmod(tmpName, 0644); err != nil {
+		zap.S().Warnf("failed to chmod temp file: %v", err)
+	}
+	if err := os.Rename(tmpName, fileName); err != nil {
+		os.Remove(tmpName)
 		return nil, err
 	}
 
